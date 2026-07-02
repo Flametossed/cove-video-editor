@@ -119,6 +119,25 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "cove_icon.png"
 
 
+def export_controls_enabled(
+    has_clips: bool,
+    has_added_audio: bool,
+    audio_only: bool,
+    exporting: bool,
+) -> bool:
+    """Whether the Export button / format combo should be enabled.
+
+    Project export needs at least one video clip; Audio Only export also
+    accepts a timeline with only AddedAudio items. Always disabled while
+    an export is running.
+    """
+    if exporting:
+        return False
+    if audio_only:
+        return has_clips or has_added_audio
+    return has_clips
+
+
 # ── Inline icon painters for transport / zoom buttons ──────────────────────
 # Avoiding an external icon file keeps the install footprint small and lets
 # icons inherit the current palette color on hover. The shapes match the
@@ -2787,6 +2806,10 @@ class MainWindow(QMainWindow):
         self._populate_format_combo(
             self.export_type_combo.currentText() == "Audio Only"
         )
+        self._update_controls_enabled()
+
+    def _is_audio_only_export(self) -> bool:
+        return self.export_type_combo.currentText() == "Audio Only"
 
     def _on_export_clicked(self) -> None:
         fmt_key = self.format_combo.currentText()
@@ -2857,6 +2880,7 @@ class MainWindow(QMainWindow):
         thread.finished.connect(self._reset_after_export)
         self._export_thread = thread
         self._export_worker = worker
+        self._update_controls_enabled()
         thread.start()
 
     def _on_cancel_clicked(self) -> None:
@@ -2924,8 +2948,8 @@ class MainWindow(QMainWindow):
     def _reset_after_export(self) -> None:
         self._export_thread = None
         self._export_worker = None
-        self.export_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self._update_controls_enabled()
 
     # --- misc ---------------------------------------------------------
 
@@ -2933,8 +2957,15 @@ class MainWindow(QMainWindow):
         loaded = bool(self._clips)
         has_any = loaded or bool(self._added_audios)
         self.play_btn.setEnabled(has_any)
-        for w in (self.crop_btn, self.format_combo, self.export_btn):
-            w.setEnabled(loaded)
+        can_export = export_controls_enabled(
+            has_clips=loaded,
+            has_added_audio=bool(self._added_audios),
+            audio_only=self._is_audio_only_export(),
+            exporting=self._export_thread is not None,
+        )
+        self.crop_btn.setEnabled(loaded)
+        self.format_combo.setEnabled(can_export)
+        self.export_btn.setEnabled(can_export)
         for w in (self.split_btn, self.delete_clip_btn):
             w.setEnabled(has_any)
         self.merge_btn.setEnabled(self._can_merge())
