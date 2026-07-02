@@ -80,6 +80,7 @@ from . import __version__
 from . import ffmpeg_utils as ff
 from . import theme
 from . import updater
+from .system_open import open_url as _open_url
 from .titlebar import TitleBar, FramelessResizer
 from .clip import (
     DEFAULT_IMAGE_DURATION,
@@ -3088,11 +3089,11 @@ class MainWindow(QMainWindow):
         if install_btn is not None and clicked is install_btn:
             self._install_update(info)
         elif open_btn is not None and clicked is open_btn:
-            QDesktopServices.openUrl(QUrl(info.release_url))
+            _open_url(info.release_url)
 
     def _install_update(self, info) -> None:
         if not info.asset_url:
-            QDesktopServices.openUrl(QUrl(info.release_url))
+            _open_url(info.release_url)
             return
         from .portable import is_portable, portable_data_dir
         if is_portable():
