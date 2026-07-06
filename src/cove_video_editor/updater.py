@@ -12,6 +12,7 @@ runs the installer themselves from there.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -58,6 +59,71 @@ def _parse_version(v: str) -> tuple[int, int, int]:
 
 def version_newer(latest: str, current: str) -> bool:
     return _parse_version(latest) > _parse_version(current)
+
+
+class ChecksumError(RuntimeError):
+    """Raised when the downloaded asset's sha256 does not match its sidecar.
+
+    Surfaced as a typed failure so the download path can refuse to swap
+    the running binary on a tampered or truncated download."""
+
+
+def _parse_sha256_sidecar(text: str) -> str:
+    """Pull the hex hash out of a ``sha256sum`` / ``Get-FileHash`` sidecar."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        token = line.split()[0]
+        if len(token) == 64 and all(c in "0123456789abcdefABCDEF" for c in token):
+            return token.lower()
+        raise ChecksumError(f"unrecognized sidecar contents: {line!r}")
+    raise ChecksumError("empty sidecar")
+
+
+def _sha256_of_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk_size)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def fetch_sha256_sidecar(url: str, timeout: float = 20.0) -> str:
+    """GET the sidecar URL and return the parsed sha256 hex digest."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "cove-video-editor-updater"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Sidecar files are tiny; cap the read so a hostile redirect
+        # can't dump unbounded bytes.
+        raw = resp.read(4096).decode("ascii", errors="replace")
+    return _parse_sha256_sidecar(raw)
+
+
+def verify_sha256(path: Path, sidecar_url: str) -> None:
+    """Verify ``path`` matches the hash advertised by ``sidecar_url``.
+
+    On any failure (network error, malformed sidecar, hash mismatch) the
+    partial download at ``path`` is unlinked and ChecksumError is raised
+    so the caller never swaps in an unverified binary."""
+    try:
+        expected = fetch_sha256_sidecar(sidecar_url)
+    except ChecksumError:
+        path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        path.unlink(missing_ok=True)
+        raise ChecksumError(f"could not fetch sidecar: {exc}") from exc
+    actual = _sha256_of_file(path)
+    if actual != expected:
+        path.unlink(missing_ok=True)
+        raise ChecksumError(
+            f"sha256 mismatch: expected {expected}, got {actual}",
+        )
 
 
 def bundle_kind() -> str:
@@ -181,6 +247,11 @@ class DownloadWorker(QObject):
                         written += len(chunk)
                         if total > 0:
                             self.progress.emit(int(written * 100 / total))
+            # The release pipeline publishes a `<asset>.sha256` sidecar
+            # next to every artifact, so its download URL is the asset
+            # URL plus the suffix. Verify before signalling success;
+            # verify_sha256 unlinks the partial on any failure.
+            verify_sha256(self._dest, self._url + ".sha256")
             self.finished.emit(str(self._dest))
         except Exception as exc:  # noqa: BLE001
             try:
@@ -212,15 +283,30 @@ def start_download(url: str, dest: Path) -> tuple[QThread, DownloadWorker]:
 
 
 def swap_in_appimage(new_path: Path) -> Path:
-    """Replace the running AppImage with `new_path`, leave it executable, and
-    return its final path. Caller is responsible for relaunching."""
+    """Install `new_path` next to the running AppImage under its own
+    versioned filename, remove the old file, and return the new path.
+    Caller is responsible for relaunching.
+
+    Keeping the release asset's filename (instead of overwriting the old
+    file in place) matches electron-updater semantics and keeps the
+    on-disk name truthful - external launchers like Cove Nexus derive the
+    installed version from it."""
     current = os.environ.get("APPIMAGE")
     if not current:
-        raise RuntimeError("APPIMAGE env var not set — not an AppImage install")
-    target = Path(current).resolve()
-    shutil.move(str(new_path), str(target))
-    mode = os.stat(target).st_mode
-    os.chmod(target, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        raise RuntimeError("APPIMAGE env var not set - not an AppImage install")
+    old = Path(current).resolve()
+    target = old.parent / new_path.name
+    tmp = target.with_name(target.name + ".part")
+    shutil.move(str(new_path), str(tmp))
+    mode = os.stat(tmp).st_mode
+    os.chmod(tmp, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    os.replace(tmp, target)
+    if target != old:
+        try:
+            old.unlink()  # unlinking the running file is fine on Linux
+        except OSError:
+            pass
+    os.environ["APPIMAGE"] = str(target)
     return target
 
 
