@@ -107,7 +107,7 @@ from .crop_overlay import CropOverlay
 from .downloader import DownloadVideoDialog
 from .exporter import AudioTrack, ExportJob, start_export
 from .thumbnails import start_thumbnails, start_waveform
-from .timeline_widget import TimelineWidget
+from .timeline_widget import TimelineMinimap, TimelineWidget
 
 
 VIDEO_FILTERS = (
@@ -1044,11 +1044,19 @@ class MainWindow(QMainWindow):
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
         self.timeline.clipMoveToStartRequested.connect(self._on_clip_move_to_start)
         self.timeline.clipMoveToPlayheadRequested.connect(self._on_clip_move_to_playhead)
+        self.timeline.clipRippleDeleteRequested.connect(self._on_clip_ripple_delete)
+        self.timeline.clipCloseGapRequested.connect(self._on_clip_close_gap)
+        self.timeline.clipReorderRequested.connect(self._on_clip_reorder)
+        self.timeline.clipNudgeRequested.connect(self._on_clip_nudge)
         self.timeline.audioOffsetChanged.connect(self._on_audio_offset_changed)
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
         self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
         self.timeline.scrollValueChanged.connect(self._on_timeline_scroll_value)
         timeline_lay.addWidget(self.timeline, stretch=1)
+
+        # Slim full-sequence overview strip for fast navigation of long edits.
+        self.minimap = TimelineMinimap(self.timeline)
+        timeline_lay.addWidget(self.minimap)
 
         # Scrollbar + VideoPad-style zoom bar share one row. Scrollbar
         # stretches; the zoom cluster sits on the right with a fixed width.
@@ -1062,6 +1070,11 @@ class MainWindow(QMainWindow):
         self.timeline_scrollbar.setMinimumWidth(120)
         self.timeline_scrollbar.valueChanged.connect(self.timeline.set_scroll_x)
         sb_row.addWidget(self.timeline_scrollbar, stretch=1)
+
+        self.zoom_fit_btn = QPushButton("Fit")
+        self.zoom_fit_btn.setToolTip("Zoom to fit the whole sequence in view")
+        self.zoom_fit_btn.clicked.connect(self.timeline.zoom_to_fit)
+        sb_row.addWidget(self.zoom_fit_btn)
 
         self.zoom_out_btn = _make_zoom_btn("minus", "Zoom out (Shift+Scroll also scrolls)")
         self.zoom_out_btn.clicked.connect(self._zoom_out_clicked)
@@ -1973,6 +1986,7 @@ class MainWindow(QMainWindow):
                 or abs(c.src_end - vals["src_end"]) > 1e-4
                 or c.muted != vals["muted"]
                 or abs(c.audio_volume - vals["audio_volume"]) > 1e-6
+                or abs(c.timeline_start - vals["timeline_start"]) > 1e-4
             )
             if not changed:
                 return
@@ -1982,9 +1996,20 @@ class MainWindow(QMainWindow):
             c.src_end = vals["src_end"]
             c.muted = vals["muted"]
             c.audio_volume = vals["audio_volume"]
+            if abs(c.timeline_start - vals["timeline_start"]) > 1e-4:
+                # Keep detached audio anchored, then place the clip and push it
+                # clear of any clip it would overlap (single video track).
+                new_start = max(0.0, vals["timeline_start"])
+                if not c.linked_audio:
+                    old_audio_abs = c.timeline_start + c.audio_offset
+                    c.audio_offset = old_audio_abs - new_start
+                c.timeline_start = new_start
+                self._resolve_clip_overlaps(c)
+                self._clips = sort_clips(self._clips)
             self.timeline.set_clips(self._clips)
             self._update_range_label()
             self._update_audio_volumes()
+            self._drive_main_player_from_playhead()
 
     def _split_at_playhead(self) -> None:
         t = self.timeline.playhead()
@@ -2189,6 +2214,110 @@ class MainWindow(QMainWindow):
 
     def _on_clip_move_to_start(self, clip_id: str) -> None:
         self._ripple_move_clip(clip_id, 0.0)
+
+    def _on_clip_ripple_delete(self, clip_id: str) -> None:
+        """Delete a clip and pull every later clip left to close the gap."""
+        clip = next((c for c in self._clips if c.id == clip_id), None)
+        if clip is None:
+            return
+        self._snapshot()
+        length = clip.timeline_length
+        old = clip.timeline_start
+        self._clips = [c for c in self._clips if c.id != clip_id]
+        for c in self._clips:
+            if c.timeline_start >= old - 1e-6:
+                c.timeline_start = max(0.0, c.timeline_start - length)
+        self._clips = sort_clips(self._clips)
+        self.timeline.set_clips(self._clips)
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        if not self._clips:
+            self._halt_playback_no_clips()
+        elif self._preview_clip_id == clip_id:
+            self._preview_clip_id = ""
+            first = self._clips[0]
+            self._set_preview_clip(first)
+            self.timeline.select_clip(first.id)
+        self._drive_main_player_from_playhead()
+        self.status.showMessage("Clip ripple-deleted; gap closed.", 2500)
+
+    def _on_clip_close_gap(self, clip_id: str) -> None:
+        """Slide a clip left until it butts against the previous clip's end
+        (or t=0), closing a single leading gap without moving anything else."""
+        ordered = sort_clips(self._clips)
+        clip = next((c for c in ordered if c.id == clip_id), None)
+        if clip is None:
+            return
+        idx = ordered.index(clip)
+        target = ordered[idx - 1].timeline_end if idx > 0 else 0.0
+        if clip.timeline_start <= target + 1e-4:
+            self.status.showMessage("No gap to close.", 2000)
+            return
+        self._snapshot()
+        clip.timeline_start = max(0.0, target)
+        self._clips = sort_clips(self._clips)
+        self.timeline.set_clips(self._clips)
+        self.timeline.select_clip(clip_id)
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        self._drive_main_player_from_playhead()
+        self.status.showMessage("Gap closed.", 2000)
+
+    def _on_clip_reorder(self, direction: int) -> None:
+        """Alt+←/→ — move the selected clip past its neighbour in the sequence
+        (a ripple swap), so it can be walked toward the front step by step."""
+        sid = self.timeline.selected_id()
+        if not sid:
+            return
+        ordered = sort_clips(self._clips)
+        ids = [c.id for c in ordered]
+        if sid not in ids:
+            return
+        idx = ids.index(sid)
+        if direction < 0 and idx > 0:
+            self._ripple_move_clip(sid, ordered[idx - 1].timeline_start)
+        elif direction > 0 and idx < len(ordered) - 1:
+            # Move the next clip into this one's slot; that pushes ours later.
+            self._ripple_move_clip(ordered[idx + 1].id, ordered[idx].timeline_start)
+            self.timeline.select_clip(sid)
+            self._sync_selected_clip_ui()
+
+    def _on_clip_nudge(self, direction: int) -> None:
+        """Ctrl+←/→ — shift the selected clip by one frame, staying clear of
+        its neighbours (a collision snaps it back against them)."""
+        sid = self.timeline.selected_id()
+        clip = next((c for c in self._clips if c.id == sid), None)
+        if clip is None:
+            return
+        step = 1.0 / max(1.0, clip.asset.fps or 30.0)
+        new_start = max(0.0, clip.timeline_start + direction * step)
+        if abs(new_start - clip.timeline_start) < 1e-6:
+            return
+        self._snapshot()
+        if not clip.linked_audio:
+            old_audio_abs = clip.timeline_start + clip.audio_offset
+            clip.audio_offset = old_audio_abs - new_start
+        clip.timeline_start = new_start
+        self._resolve_clip_overlaps(clip)
+        self._clips = sort_clips(self._clips)
+        self.timeline.set_clips(self._clips)
+        self.timeline.select_clip(sid)
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        self._drive_main_player_from_playhead()
+
+    def _resolve_clip_overlaps(self, moved: Clip) -> None:
+        """Push `moved` to the right of any clip it overlaps — mirrors the
+        drag-release overlap policy so a single video track never stacks."""
+        others = sorted(
+            (c for c in self._clips if c.id != moved.id),
+            key=lambda c: c.timeline_start,
+        )
+        for oc in others:
+            if moved.timeline_end <= oc.timeline_start or moved.timeline_start >= oc.timeline_end:
+                continue
+            moved.timeline_start = oc.timeline_end
+            return self._resolve_clip_overlaps(moved)
 
     def _on_clip_move_to_playhead(self, clip_id: str) -> None:
         self._ripple_move_clip(clip_id, self.timeline.playhead())
@@ -3544,6 +3673,14 @@ class ClipPropertiesDialog(QDialog):
         lay.addWidget(header)
 
         form = QFormLayout()
+        self.start_pos = QDoubleSpinBox()
+        self.start_pos.setRange(0.0, 86400.0)
+        self.start_pos.setDecimals(3); self.start_pos.setSuffix(" s")
+        self.start_pos.setSingleStep(0.5)
+        self.start_pos.setValue(clip.timeline_start)
+        self.start_pos.setToolTip("Where this clip starts on the timeline")
+        form.addRow("Timeline start", self.start_pos)
+
         self.speed = QDoubleSpinBox()
         self.speed.setRange(0.25, 4.0); self.speed.setSingleStep(0.25)
         self.speed.setDecimals(2); self.speed.setSuffix("x")
@@ -3598,6 +3735,7 @@ class ClipPropertiesDialog(QDialog):
             QMessageBox.information(self, "Invalid trim", "End must be after start.")
             return
         self._result = {
+            "timeline_start": self.start_pos.value(),
             "speed": self.speed.value(),
             "src_start": s,
             "src_end": e,

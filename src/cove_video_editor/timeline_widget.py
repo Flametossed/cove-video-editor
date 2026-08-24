@@ -104,6 +104,11 @@ class TimelineWidget(QWidget):
     clipDeleteRequested = Signal(str)             # clip id
     clipMoveToStartRequested = Signal(str)        # clip id — jump to t=0 (ripple)
     clipMoveToPlayheadRequested = Signal(str)     # clip id — jump to playhead (ripple)
+    clipRippleDeleteRequested = Signal(str)       # clip id — delete + pull rest left
+    clipCloseGapRequested = Signal(str)           # clip id — butt against previous clip
+    clipReorderRequested = Signal(int)            # -1 = earlier, +1 = later (selected)
+    clipNudgeRequested = Signal(int)              # -1 = left, +1 = right (one frame)
+    clipsChanged = Signal()                       # clip list replaced (for the minimap)
     audioOffsetChanged = Signal(str, float)       # clip id, new audio_offset (seconds)
     clipAudioRemoveRequested = Signal(str)        # clip id — delete clip's audio only
     scrollRangeChanged = Signal(int, int)         # scroll_max, page (in px)
@@ -184,6 +189,47 @@ class TimelineWidget(QWidget):
         self._clips = sort_clips(clips)
         if self._selected_id and not any(c.id == self._selected_id for c in self._clips):
             self._selected_id = ""
+        self._publish_scroll_range()
+        self.clipsChanged.emit()
+        self.update()
+
+    # ---- read-only views (used by the minimap overview) ----------------
+
+    def total_length(self) -> float:
+        return self._total_length()
+
+    def clip_spans(self) -> list[tuple[float, float, bool]]:
+        """(`start`, `end`, `is_selected`) for every video clip — enough for
+        the minimap to draw miniature blocks."""
+        return [
+            (c.timeline_start, c.timeline_end, c.id == self._selected_id)
+            for c in self._clips
+        ]
+
+    def view_window(self) -> tuple[float, float]:
+        """Visible time range [start, end] given the current scroll + zoom."""
+        tr = self._track_rect()
+        start = self._scroll_x / max(0.01, self._pps)
+        end = (self._scroll_x + tr.width()) / max(0.01, self._pps)
+        return (start, end)
+
+    def zoom_to_fit(self) -> None:
+        """Set the zoom so the whole sequence fits the visible track width."""
+        total = self._total_length()
+        if total <= 0.01:
+            return
+        tr = self._track_rect()
+        target = max(MIN_PPS, min(MAX_PPS, (tr.width() - 4) / total))
+        self._scroll_x = 0
+        self.set_pixels_per_second(target)
+        self._publish_scroll_range()
+        self.update()
+
+    def center_view_on(self, t: float) -> None:
+        """Scroll so timeline time `t` sits in the middle of the view."""
+        tr = self._track_rect()
+        self._scroll_x = max(0, min(self.scroll_max_px(),
+                                    int(t * self._pps - tr.width() / 2)))
         self._publish_scroll_range()
         self.update()
 
@@ -1316,6 +1362,11 @@ class TimelineWidget(QWidget):
                 self.regionDeleteRequested.emit(self._sel_start, self._sel_end)
                 event.accept()
                 return
+            # Shift+Delete on a selected clip → ripple delete (pull rest left).
+            if (event.modifiers() & Qt.ShiftModifier) and self._selected_id:
+                self.clipRippleDeleteRequested.emit(self._selected_id)
+                event.accept()
+                return
             if self._added_audio_selected_id:
                 audio_id = self._added_audio_selected_id
                 self._added_audio_selected_id = ""
@@ -1336,6 +1387,18 @@ class TimelineWidget(QWidget):
             self.splitAtPlayheadRequested.emit()
             event.accept()
             return
+        # Selected-clip keyboard moves: Alt+←/→ reorders it past a neighbour;
+        # Ctrl+←/→ nudges it by one frame.
+        if self._selected_id and event.key() in (Qt.Key_Left, Qt.Key_Right):
+            direction = -1 if event.key() == Qt.Key_Left else 1
+            if event.modifiers() & Qt.AltModifier:
+                self.clipReorderRequested.emit(direction)
+                event.accept()
+                return
+            if event.modifiers() & Qt.ControlModifier:
+                self.clipNudgeRequested.emit(direction)
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     # ---- helpers ------------------------------------------------------
@@ -1483,10 +1546,14 @@ class TimelineWidget(QWidget):
         menu.addAction("Split at Playhead")
         move_start_action = None
         move_playhead_action = None
+        ripple_del_action = None
+        close_gap_action = None
         if clicked_clip is not None:
             menu.addSeparator()
             move_start_action = menu.addAction("Move Clip to Start")
             move_playhead_action = menu.addAction("Move Clip to Playhead")
+            close_gap_action = menu.addAction("Close Gap Left")
+            ripple_del_action = menu.addAction("Ripple Delete (close gap)")
         replace_action = None
         remove_this_action = None
         remove_all_action = None
@@ -1525,6 +1592,12 @@ class TimelineWidget(QWidget):
             return
         if move_playhead_action is not None and chosen is move_playhead_action:
             self.clipMoveToPlayheadRequested.emit(clicked_clip.id)
+            return
+        if close_gap_action is not None and chosen is close_gap_action:
+            self.clipCloseGapRequested.emit(clicked_clip.id)
+            return
+        if ripple_del_action is not None and chosen is ripple_del_action:
+            self.clipRippleDeleteRequested.emit(clicked_clip.id)
             return
         if add_lane_action is not None and chosen is add_lane_action:
             self.add_audio_lane()
@@ -1634,6 +1707,93 @@ class TimelineWidget(QWidget):
     def sizeHint(self) -> QSize:
         audio_total = sum(self._audio_lane_heights) + TRACK_GAP * len(self._audio_lane_heights)
         return QSize(900, RULER_H + TRACK_GAP + self._video_h + audio_total + 4)
+
+
+class TimelineMinimap(QWidget):
+    """Slim full-sequence overview strip shown under the timeline.
+
+    Draws every video clip as a miniature block plus a translucent viewport
+    box for the currently-visible window and the playhead. Click or drag
+    anywhere to recentre the main timeline view on that point — the fast way
+    to navigate a long sequence without wheeling across it."""
+
+    _PAD = 6
+
+    def __init__(self, timeline: "TimelineWidget", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._tl = timeline
+        self.setFixedHeight(34)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Overview — click or drag to jump the timeline view")
+        # Repaint whenever the view or content the strip mirrors changes.
+        timeline.pixelsPerSecondChanged.connect(lambda *_: self.update())
+        timeline.scrollValueChanged.connect(lambda *_: self.update())
+        timeline.playheadMoved.connect(lambda *_: self.update())
+        timeline.clipsChanged.connect(self.update)
+
+    def _x_of(self, t: float, total: float, w: int) -> int:
+        return self._PAD + int((t / total) * w)
+
+    def paintEvent(self, _event) -> None:  # noqa: ANN001
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), theme.C_RULER_BG)
+        p.setPen(QPen(theme.C_BORDER, 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
+
+        total = self._tl.total_length()
+        if total <= 0.01:
+            p.setPen(theme.C_TEXT_3)
+            p.drawText(self.rect(), Qt.AlignCenter, "overview")
+            p.end()
+            return
+
+        w = max(1, self.width() - 2 * self._PAD)
+        top, h = 7, self.height() - 14
+        for start, end, selected in self._tl.clip_spans():
+            x0 = self._x_of(start, total, w)
+            x1 = self._x_of(end, total, w)
+            block = QRect(x0, top, max(2, x1 - x0), h)
+            p.fillRect(block, theme.C_VIDEO_CLIP_B)
+            p.setPen(QPen(theme.C_ACCENT if selected else theme.C_VIDEO_CLIP_BD, 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(block.adjusted(0, 0, -1, -1))
+
+        vs, ve = self._tl.view_window()
+        vs, ve = max(0.0, vs), min(total, ve)
+        if ve > vs:
+            vx0 = self._x_of(vs, total, w)
+            vx1 = self._x_of(ve, total, w)
+            vp = QRect(vx0, 3, max(6, vx1 - vx0), self.height() - 6)
+            p.fillRect(vp, QColor(94, 234, 212, 40))
+            p.setPen(QPen(QColor(94, 234, 212, 210), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(vp.adjusted(0, 0, -1, -1))
+
+        px = self._x_of(min(total, self._tl.playhead()), total, w)
+        p.setPen(QPen(theme.C_ACCENT, 1))
+        p.drawLine(px, 2, px, self.height() - 2)
+        p.end()
+
+    def _jump(self, x: int) -> None:
+        total = self._tl.total_length()
+        if total <= 0.01:
+            return
+        w = max(1, self.width() - 2 * self._PAD)
+        frac = max(0.0, min(1.0, (x - self._PAD) / w))
+        self._tl.center_view_on(frac * total)
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._jump(int(event.position().x()))
+            event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if event.buttons() & Qt.LeftButton:
+            self._jump(int(event.position().x()))
+            event.accept()
 
 
 def _choose_tick_step(pps: float) -> float:
