@@ -1743,7 +1743,7 @@ class TimelineMinimap(QWidget):
     def __init__(self, timeline: "TimelineWidget", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._tl = timeline
-        self.setFixedHeight(30)
+        self.setFixedHeight(16)
         self.setMouseTracking(True)
         self.setToolTip(
             "Overview — drag the box to pan, drag its edges to zoom, "
@@ -1783,35 +1783,31 @@ class TimelineMinimap(QWidget):
 
         total = self._tl.total_length()
         if total <= 0.01:
-            p.setPen(theme.C_TEXT_3)
-            p.drawText(self.rect(), Qt.AlignCenter, "overview")
             p.end()
             return
 
-        top, h = 5, self.height() - 10
+        top, h = 2, self.height() - 4
         for start, end, selected in self._tl.clip_spans():
             x0 = self._x_of(start, total)
             x1 = self._x_of(end, total)
             block = QRect(x0, top, max(2, x1 - x0), h)
             p.fillRect(block, theme.C_VIDEO_CLIP_B)
-            p.setPen(QPen(theme.C_ACCENT if selected else theme.C_VIDEO_CLIP_BD, 1))
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(block.adjusted(0, 0, -1, -1))
+            if selected:
+                p.setPen(QPen(theme.C_ACCENT, 1))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(block.adjusted(0, 0, -1, -1))
 
         vx0, vx1 = self._viewport_px(total)
         if vx1 > vx0:
-            vp = QRect(vx0, 2, max(6, vx1 - vx0), self.height() - 4)
+            vp = QRect(vx0, 1, max(6, vx1 - vx0), self.height() - 2)
             p.fillRect(vp, QColor(94, 234, 212, 45))
             p.setPen(QPen(QColor(94, 234, 212, 220), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(vp.adjusted(0, 0, -1, -1))
-            # Grip ticks on each edge to signal it's resizable.
-            for ex in (vp.left() + 2, vp.right() - 2):
-                p.drawLine(ex, vp.top() + 4, ex, vp.bottom() - 4)
 
         px = self._x_of(min(total, self._tl.playhead()), total)
         p.setPen(QPen(theme.C_ACCENT, 1))
-        p.drawLine(px, 2, px, self.height() - 2)
+        p.drawLine(px, 1, px, self.height() - 1)
         p.end()
 
     def _hit(self, x: int, total: float) -> str:

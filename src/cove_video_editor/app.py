@@ -1179,7 +1179,11 @@ class MainWindow(QMainWindow):
         # still guarantees the panel never shrinks below its content min).
         main_split.setStretchFactor(0, 1)
         main_split.setStretchFactor(1, 0)
-        main_split.setSizes([520, 380])
+        # Hint the timeline pane below its content min so the splitter clamps
+        # it to exactly its content height (no dead space below the tracks);
+        # the preview absorbs everything else. It still auto-grows if audio
+        # lanes are added, since the panel's minimum grows with them.
+        main_split.setSizes([760, 120])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
