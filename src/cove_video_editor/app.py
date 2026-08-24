@@ -67,7 +67,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
-    QScrollBar,
     QSizeGrip,
     QSizePolicy,
     QSlider,
@@ -672,25 +671,6 @@ class MainWindow(QMainWindow):
 
     # --- scrollbar glue ------------------------------------------------
 
-    def _on_timeline_scroll_range(self, max_px: int, page_px: int) -> None:
-        sb = self.timeline_scrollbar
-        sb.blockSignals(True)
-        sb.setRange(0, max(0, max_px))
-        sb.setPageStep(max(1, page_px))
-        sb.setSingleStep(40)
-        sb.blockSignals(False)
-        # Always visible — disabled (grayed out) when there's nothing to
-        # scroll, so the zoom cluster stays pinned right in the row
-        # instead of stretching across an empty gap. VideoPad does the same.
-        sb.setEnabled(max_px > 0)
-
-    def _on_timeline_scroll_value(self, v: int) -> None:
-        sb = self.timeline_scrollbar
-        if sb.value() != v:
-            sb.blockSignals(True)
-            sb.setValue(v)
-            sb.blockSignals(False)
-
     # --- zoom bar ------------------------------------------------------
 
     def _pps_to_slider(self, pps: float) -> int:
@@ -1050,26 +1030,18 @@ class MainWindow(QMainWindow):
         self.timeline.clipNudgeRequested.connect(self._on_clip_nudge)
         self.timeline.audioOffsetChanged.connect(self._on_audio_offset_changed)
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
-        self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
-        self.timeline.scrollValueChanged.connect(self._on_timeline_scroll_value)
         timeline_lay.addWidget(self.timeline, stretch=1)
 
-        # Slim full-sequence overview strip for fast navigation of long edits.
-        self.minimap = TimelineMinimap(self.timeline)
-        timeline_lay.addWidget(self.minimap)
-
-        # Scrollbar + VideoPad-style zoom bar share one row. Scrollbar
-        # stretches; the zoom cluster sits on the right with a fixed width.
+        # One nav row: the full-sequence overview (which doubles as the
+        # scrollbar — drag its viewport box to pan, its edges to zoom) plus
+        # the zoom cluster on the right. Replaces the old separate scrollbar.
         sb_bar = QFrame()
         sb_bar.setObjectName("ZoomBar")
         sb_row = QHBoxLayout(sb_bar)
-        sb_row.setContentsMargins(12, 4, 12, 4)
+        sb_row.setContentsMargins(12, 5, 12, 5)
         sb_row.setSpacing(8)
-        self.timeline_scrollbar = QScrollBar(Qt.Horizontal)
-        self.timeline_scrollbar.setRange(0, 0)
-        self.timeline_scrollbar.setMinimumWidth(120)
-        self.timeline_scrollbar.valueChanged.connect(self.timeline.set_scroll_x)
-        sb_row.addWidget(self.timeline_scrollbar, stretch=1)
+        self.minimap = TimelineMinimap(self.timeline)
+        sb_row.addWidget(self.minimap, stretch=1)
 
         self.zoom_fit_btn = QPushButton("Fit")
         self.zoom_fit_btn.setToolTip("Zoom to fit the whole sequence in view")

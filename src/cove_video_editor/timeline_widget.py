@@ -233,6 +233,25 @@ class TimelineWidget(QWidget):
         self._publish_scroll_range()
         self.update()
 
+    def set_view_start(self, t: float) -> None:
+        """Scroll so the view begins at timeline time `t` (overview panning)."""
+        self._scroll_x = max(0, min(self.scroll_max_px(), int(t * self._pps)))
+        self._publish_scroll_range()
+        self.update()
+
+    def set_visible_span(self, start_t: float, end_t: float) -> None:
+        """Zoom + scroll so the time range [start_t, end_t] fills the view —
+        used when dragging an edge of the overview's viewport box."""
+        span = max(0.05, end_t - start_t)
+        tr = self._track_rect()
+        new_pps = max(MIN_PPS, min(MAX_PPS, tr.width() / span))
+        if abs(new_pps - self._pps) > 1e-6:
+            self._pps = new_pps
+            self.pixelsPerSecondChanged.emit(self._pps)
+        self._scroll_x = max(0, min(self.scroll_max_px(), int(start_t * new_pps)))
+        self._publish_scroll_range()
+        self.update()
+
     def selected_id(self) -> str:
         return self._selected_id
 
@@ -1718,29 +1737,49 @@ class TimelineMinimap(QWidget):
     to navigate a long sequence without wheeling across it."""
 
     _PAD = 6
+    _EDGE = 5              # px hit zone for the viewport box's resize edges
+    _MIN_SPAN = 0.2        # smallest visible span (s) an edge-drag can zoom to
 
     def __init__(self, timeline: "TimelineWidget", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._tl = timeline
-        self.setFixedHeight(34)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Overview — click or drag to jump the timeline view")
+        self.setFixedHeight(30)
+        self.setMouseTracking(True)
+        self.setToolTip(
+            "Overview — drag the box to pan, drag its edges to zoom, "
+            "click elsewhere to jump."
+        )
+        self._mode = ""            # "", "pan", "zoom_l", "zoom_r"
+        self._grab_dt = 0.0        # pan: cursor time minus view start at grab
+        self._fixed_t = 0.0        # zoom: the edge held fixed
         # Repaint whenever the view or content the strip mirrors changes.
         timeline.pixelsPerSecondChanged.connect(lambda *_: self.update())
         timeline.scrollValueChanged.connect(lambda *_: self.update())
         timeline.playheadMoved.connect(lambda *_: self.update())
         timeline.clipsChanged.connect(self.update)
 
-    def _x_of(self, t: float, total: float, w: int) -> int:
-        return self._PAD + int((t / total) * w)
+    def _w(self) -> int:
+        return max(1, self.width() - 2 * self._PAD)
+
+    def _x_of(self, t: float, total: float) -> int:
+        return self._PAD + int((t / total) * self._w())
+
+    def _t_of(self, x: int, total: float) -> float:
+        frac = max(0.0, min(1.0, (x - self._PAD) / self._w()))
+        return frac * total
+
+    def _viewport_px(self, total: float) -> tuple[int, int]:
+        vs, ve = self._tl.view_window()
+        return self._x_of(max(0.0, vs), total), self._x_of(min(total, ve), total)
 
     def paintEvent(self, _event) -> None:  # noqa: ANN001
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), theme.C_RULER_BG)
+        # Inset "groove" look — sits inside the zoom-bar pill.
+        p.fillRect(self.rect(), QColor("#0a1013"))
         p.setPen(QPen(theme.C_BORDER, 1))
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 5, 5)
 
         total = self._tl.total_length()
         if total <= 0.01:
@@ -1749,51 +1788,87 @@ class TimelineMinimap(QWidget):
             p.end()
             return
 
-        w = max(1, self.width() - 2 * self._PAD)
-        top, h = 7, self.height() - 14
+        top, h = 5, self.height() - 10
         for start, end, selected in self._tl.clip_spans():
-            x0 = self._x_of(start, total, w)
-            x1 = self._x_of(end, total, w)
+            x0 = self._x_of(start, total)
+            x1 = self._x_of(end, total)
             block = QRect(x0, top, max(2, x1 - x0), h)
             p.fillRect(block, theme.C_VIDEO_CLIP_B)
             p.setPen(QPen(theme.C_ACCENT if selected else theme.C_VIDEO_CLIP_BD, 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(block.adjusted(0, 0, -1, -1))
 
-        vs, ve = self._tl.view_window()
-        vs, ve = max(0.0, vs), min(total, ve)
-        if ve > vs:
-            vx0 = self._x_of(vs, total, w)
-            vx1 = self._x_of(ve, total, w)
-            vp = QRect(vx0, 3, max(6, vx1 - vx0), self.height() - 6)
-            p.fillRect(vp, QColor(94, 234, 212, 40))
-            p.setPen(QPen(QColor(94, 234, 212, 210), 1))
+        vx0, vx1 = self._viewport_px(total)
+        if vx1 > vx0:
+            vp = QRect(vx0, 2, max(6, vx1 - vx0), self.height() - 4)
+            p.fillRect(vp, QColor(94, 234, 212, 45))
+            p.setPen(QPen(QColor(94, 234, 212, 220), 1))
             p.setBrush(Qt.NoBrush)
             p.drawRect(vp.adjusted(0, 0, -1, -1))
+            # Grip ticks on each edge to signal it's resizable.
+            for ex in (vp.left() + 2, vp.right() - 2):
+                p.drawLine(ex, vp.top() + 4, ex, vp.bottom() - 4)
 
-        px = self._x_of(min(total, self._tl.playhead()), total, w)
+        px = self._x_of(min(total, self._tl.playhead()), total)
         p.setPen(QPen(theme.C_ACCENT, 1))
         p.drawLine(px, 2, px, self.height() - 2)
         p.end()
 
-    def _jump(self, x: int) -> None:
+    def _hit(self, x: int, total: float) -> str:
+        vx0, vx1 = self._viewport_px(total)
+        if abs(x - vx0) <= self._EDGE:
+            return "zoom_l"
+        if abs(x - vx1) <= self._EDGE:
+            return "zoom_r"
+        if vx0 < x < vx1:
+            return "pan"
+        return "jump"
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        total = self._tl.total_length()
+        if event.button() != Qt.LeftButton or total <= 0.01:
+            return
+        x = int(event.position().x())
+        vs, ve = self._tl.view_window()
+        hit = self._hit(x, total)
+        if hit == "zoom_l":
+            self._mode, self._fixed_t = "zoom_l", ve
+        elif hit == "zoom_r":
+            self._mode, self._fixed_t = "zoom_r", vs
+        else:
+            if hit == "jump":
+                self._tl.center_view_on(self._t_of(x, total))
+                vs, _ = self._tl.view_window()
+            self._mode = "pan"
+            self._grab_dt = self._t_of(x, total) - vs
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
         total = self._tl.total_length()
         if total <= 0.01:
             return
-        w = max(1, self.width() - 2 * self._PAD)
-        frac = max(0.0, min(1.0, (x - self._PAD) / w))
-        self._tl.center_view_on(frac * total)
-        self.update()
+        x = int(event.position().x())
+        if not (event.buttons() & Qt.LeftButton):
+            hit = self._hit(x, total)
+            self.setCursor(
+                Qt.SizeHorCursor if hit in ("zoom_l", "zoom_r")
+                else (Qt.OpenHandCursor if hit == "pan" else Qt.PointingHandCursor)
+            )
+            return
+        t = self._t_of(x, total)
+        if self._mode == "pan":
+            self._tl.set_view_start(t - self._grab_dt)
+        elif self._mode == "zoom_l":
+            new_start = max(0.0, min(t, self._fixed_t - self._MIN_SPAN))
+            self._tl.set_visible_span(new_start, self._fixed_t)
+        elif self._mode == "zoom_r":
+            new_end = min(total, max(t, self._fixed_t + self._MIN_SPAN))
+            self._tl.set_visible_span(self._fixed_t, new_end)
+        event.accept()
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self._jump(int(event.position().x()))
-            event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if event.buttons() & Qt.LeftButton:
-            self._jump(int(event.position().x()))
-            event.accept()
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._mode = ""
+        event.accept()
 
 
 def _choose_tick_step(pps: float) -> float:
