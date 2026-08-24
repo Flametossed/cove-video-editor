@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -57,6 +57,12 @@ HANDLE_W = 8
 MIN_PPS = 5.0
 MAX_PPS = 800.0
 CLICK_SLOP_PX = 5
+# Auto-scroll while dragging a clip/audio/selection near a track edge, so a
+# long move can be made in one gesture instead of drag-drop-scroll-repeat.
+EDGE_SCROLL_ZONE_PX = 44          # distance from edge that arms auto-scroll
+EDGE_SCROLL_INTERVAL_MS = 16      # ~60 fps
+EDGE_SCROLL_MIN_STEP = 3.0        # px per tick at the zone's inner edge
+EDGE_SCROLL_MAX_STEP = 26.0       # px per tick right at the track edge
 CHAIN_BTN_W = 22
 CHAIN_BTN_H = 18
 CHAIN_BTN_MARGIN = 4
@@ -96,6 +102,8 @@ class TimelineWidget(QWidget):
     clipDoubleClicked = Signal(str)               # clip id
     audioLinkToggled = Signal(str)                # clip id
     clipDeleteRequested = Signal(str)             # clip id
+    clipMoveToStartRequested = Signal(str)        # clip id — jump to t=0 (ripple)
+    clipMoveToPlayheadRequested = Signal(str)     # clip id — jump to playhead (ripple)
     audioOffsetChanged = Signal(str, float)       # clip id, new audio_offset (seconds)
     clipAudioRemoveRequested = Signal(str)        # clip id — delete clip's audio only
     scrollRangeChanged = Signal(int, int)         # scroll_max, page (in px)
@@ -126,6 +134,14 @@ class TimelineWidget(QWidget):
         self._added_audios: list[AddedAudio] = []
         self._added_audio_replace: bool = False
         self._added_audio_selected_id: str = ""
+        # Edge auto-scroll during a drag: a timer nudges the horizontal scroll
+        # while the cursor is held in the edge zone, re-applying the drag at
+        # the held position so the clip keeps moving past the visible edge.
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(EDGE_SCROLL_INTERVAL_MS)
+        self._autoscroll_timer.timeout.connect(self._on_autoscroll_tick)
+        self._autoscroll_step: float = 0.0
+        self._autoscroll_pos = QPoint()
 
     # ---- audio-lane management ----------------------------------------
 
@@ -1091,6 +1107,22 @@ class TimelineWidget(QWidget):
                 or abs(pos.y() - self._drag.press_y) > CLICK_SLOP_PX):
             self._drag.moved = True
 
+        self._apply_drag_at(pos)
+        self._update_autoscroll(pos)
+
+    # ---- drag application + edge auto-scroll --------------------------
+
+    # Drag modes that move something along the time axis benefit from
+    # auto-scrolling when the cursor reaches a track edge.
+    _AUTOSCROLL_MODES = frozenset({
+        "seek", "select", "move_clip", "move_audio", "move_added",
+        "trim_l", "trim_r", "trim_added_l", "trim_added_r",
+    })
+
+    def _apply_drag_at(self, pos: QPoint) -> None:
+        """Apply the in-progress drag for the cursor position `pos`. Split out
+        of mouseMoveEvent so the edge auto-scroll timer can re-run it at the
+        held position after nudging the scroll offset."""
         t = self._x_to_time(pos.x())
         if self._drag.mode == "seek":
             self.set_playhead(t)
@@ -1157,7 +1189,62 @@ class TimelineWidget(QWidget):
                 self._refresh_min_height()
                 self.update()
 
+    def _update_autoscroll(self, pos: QPoint) -> None:
+        """Arm / disarm edge auto-scroll based on how close `pos` is to a
+        track edge. Only active for time-axis drags, and only in the
+        direction there's still room to scroll."""
+        if self._drag.mode not in self._AUTOSCROLL_MODES or not self._drag.moved:
+            self._stop_autoscroll()
+            return
+        tr = self._track_rect()
+        step = 0.0
+        left_edge = tr.left() + EDGE_SCROLL_ZONE_PX
+        right_edge = tr.right() - EDGE_SCROLL_ZONE_PX
+        if pos.x() < left_edge and self._scroll_x > 0:
+            depth = min(EDGE_SCROLL_ZONE_PX, left_edge - pos.x())
+            step = -self._edge_step(depth)
+        elif pos.x() > right_edge and self._scroll_x < self.scroll_max_px():
+            depth = min(EDGE_SCROLL_ZONE_PX, pos.x() - right_edge)
+            step = self._edge_step(depth)
+        self._autoscroll_step = step
+        self._autoscroll_pos = pos
+        if step != 0.0:
+            if not self._autoscroll_timer.isActive():
+                self._autoscroll_timer.start()
+        else:
+            self._stop_autoscroll()
+
+    @staticmethod
+    def _edge_step(depth: float) -> float:
+        """Map how deep the cursor is in the edge zone (0..zone px) to a
+        per-tick scroll step — faster the closer to the very edge."""
+        frac = max(0.0, min(1.0, depth / EDGE_SCROLL_ZONE_PX))
+        return EDGE_SCROLL_MIN_STEP + frac * (EDGE_SCROLL_MAX_STEP - EDGE_SCROLL_MIN_STEP)
+
+    def _on_autoscroll_tick(self) -> None:
+        if not self._drag.mode or self._autoscroll_step == 0.0:
+            self._stop_autoscroll()
+            return
+        new_scroll = int(max(0, min(self.scroll_max_px(),
+                                    self._scroll_x + self._autoscroll_step)))
+        if new_scroll == self._scroll_x:
+            # Reached the start/end — nothing more to reveal this direction.
+            self._stop_autoscroll()
+            return
+        self._scroll_x = new_scroll
+        # Re-apply the drag at the held cursor position; because the scroll
+        # moved, that screen x now maps to a new time, so the clip keeps going.
+        self._apply_drag_at(self._autoscroll_pos)
+        self._publish_scroll_range()
+        self.update()
+
+    def _stop_autoscroll(self) -> None:
+        self._autoscroll_step = 0.0
+        if self._autoscroll_timer.isActive():
+            self._autoscroll_timer.stop()
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._stop_autoscroll()
         mode = self._drag.mode
         if mode in ("trim_l", "trim_r"):
             c = self._find(self._drag.clip_id)
@@ -1382,6 +1469,9 @@ class TimelineWidget(QWidget):
             self._hit_added_audio(local_pos, lane=clicked_lane)
             if clicked_lane is not None else None
         )
+        # Which video clip (if any) sits under the cursor — via its video
+        # block or its lane-0 audio block. Enables zero-drag repositioning.
+        clicked_clip = self._clip_under(local_pos)
         menu = QMenu(self)
         if has_selection:
             menu.addAction("Delete Selected Region")
@@ -1391,6 +1481,12 @@ class TimelineWidget(QWidget):
             menu.addAction("(no region selected)").setEnabled(False)
         menu.addSeparator()
         menu.addAction("Split at Playhead")
+        move_start_action = None
+        move_playhead_action = None
+        if clicked_clip is not None:
+            menu.addSeparator()
+            move_start_action = menu.addAction("Move Clip to Start")
+            move_playhead_action = menu.addAction("Move Clip to Playhead")
         replace_action = None
         remove_this_action = None
         remove_all_action = None
@@ -1423,6 +1519,12 @@ class TimelineWidget(QWidget):
         text = chosen.text()
         if text == "Split at Playhead":
             self.splitAtPlayheadRequested.emit()
+            return
+        if move_start_action is not None and chosen is move_start_action:
+            self.clipMoveToStartRequested.emit(clicked_clip.id)
+            return
+        if move_playhead_action is not None and chosen is move_playhead_action:
+            self.clipMoveToPlayheadRequested.emit(clicked_clip.id)
             return
         if add_lane_action is not None and chosen is add_lane_action:
             self.add_audio_lane()
@@ -1515,6 +1617,19 @@ class TimelineWidget(QWidget):
 
     def _find(self, clip_id: str) -> Clip | None:
         return next((c for c in self._clips if c.id == clip_id), None)
+
+    def _clip_under(self, pos: QPoint) -> Clip | None:
+        """The video clip under `pos`, matched against its video block or its
+        lane-0 audio block. Used by the context menu's move actions."""
+        vr = self._video_rect()
+        for c in self._clips:
+            if self._clip_rect(c, vr).contains(pos):
+                return c
+        for c in self._clips:
+            if c.asset.has_audio and not c.audio_removed:
+                if self._audio_clip_rect(c).contains(pos):
+                    return c
+        return None
 
     def sizeHint(self) -> QSize:
         audio_total = sum(self._audio_lane_heights) + TRACK_GAP * len(self._audio_lane_heights)
