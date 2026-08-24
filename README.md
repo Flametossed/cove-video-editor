@@ -219,6 +219,10 @@ and more legible on top.
 
 ### Export
 
+- **Hardware acceleration (NVENC / AMF)** — Automatic GPU encoding with NVIDIA
+  NVENC (`hevc_nvenc` / `h264_nvenc`) or AMD AMF (`hevc_amf` / `h264_amf`) for
+  dramatically faster exports. Falls back cleanly to CPU (`libx264` / `libx265`)
+  when no supported GPU is present or when forced by the user.
 - **MP4 (H.264 + AAC), MP4 (H.265), MKV, WebM (VP9 + Opus), MOV, AVI, GIF,
   MP3, WAV** — all driven from the same ffmpeg filtergraph.
 - **Region export** — export only the selected range by piping the final map

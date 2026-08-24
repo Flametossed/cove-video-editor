@@ -58,6 +58,8 @@ class ExportJob:
     # SubtitleTrack is applied to the concat'd video output via the
     # `subtitles=` filter before final mapping.
     subtitles: SubtitleTrack | None = None
+    # Encoder preference: "auto" (GPU if available), "cpu", "nvenc", "amf"
+    encoder_pref: str = "auto"
 
     @property
     def total_timeline(self) -> float:
@@ -213,13 +215,28 @@ class ExportWorker(QObject):
             ]
 
         if spec["vcodec"]:
-            cmd += ["-c:v", spec["vcodec"]]
-            if spec["vcodec"] == "libx264":
-                cmd += ["-crf", "20", "-preset", "medium"]
-            elif spec["vcodec"] == "libx265":
-                cmd += ["-crf", "24", "-preset", "medium"]
-            if job.fps:
-                cmd += ["-r", str(job.fps)]
+            nvenc_codec = spec.get("nvenc_codec")
+            amf_codec = spec.get("amf_codec")
+            use_nvenc = bool(
+                nvenc_codec
+                and job.encoder_pref in ("auto", "nvenc")
+                and ff.nvenc_available(nvenc_codec)
+            )
+            use_amf = bool(
+                amf_codec
+                and job.encoder_pref in ("auto", "amf")
+                and ff.amf_available(amf_codec)
+                and not use_nvenc
+            )
+
+            if use_nvenc:
+                active_vcodec = nvenc_codec
+            elif use_amf:
+                active_vcodec = amf_codec
+            else:
+                active_vcodec = spec["vcodec"]
+
+            cmd += build_export_video_encoder_args(active_vcodec, fps=job.fps)
         if needs_audio and spec["acodec"]:
             cmd += ["-c:a", spec["acodec"]]
             if spec["acodec"] == "aac":
@@ -658,6 +675,37 @@ def _atempo_chain(speed: float) -> str:
     return ",atempo=".join(f"{v:.4f}" for v in chain)
 
 
+def build_export_video_encoder_args(
+    encoder: str,
+    fps: int | None = None,
+) -> list[str]:
+    """Build the video-encoder portion of an ffmpeg command for export.
+
+    Rate control / presets:
+      • NVIDIA NVENC: VBR constant-quality via -rc vbr -cq <target> -b:v 0 with preset p6, tune hq
+      • AMD AMF: constant-quality via -rc cqp -qp <target> with quality balanced, usage transcoding
+      • CPU (x264/x265): -crf <target> with preset medium
+      • Others (e.g. libvpx-vp9, mpeg4, gif): -c:v <encoder>
+    """
+    args: list[str] = ["-c:v", encoder]
+    if encoder == "h264_nvenc":
+        args += ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "22", "-b:v", "0"]
+    elif encoder == "hevc_nvenc":
+        args += ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "26", "-b:v", "0"]
+    elif encoder == "h264_amf":
+        args += ["-quality", "balanced", "-usage", "transcoding", "-rc", "cqp", "-qp", "23"]
+    elif encoder == "hevc_amf":
+        args += ["-quality", "balanced", "-usage", "transcoding", "-rc", "cqp", "-qp", "27"]
+    elif encoder == "libx264":
+        args += ["-crf", "20", "-preset", "medium"]
+    elif encoder == "libx265":
+        args += ["-crf", "24", "-preset", "medium"]
+
+    if fps:
+        args += ["-r", str(fps)]
+    return args
+
+
 def start_export(job: ExportJob) -> tuple[QThread, ExportWorker]:
     thread = QThread()
     worker = ExportWorker(job)
@@ -666,3 +714,4 @@ def start_export(job: ExportJob) -> tuple[QThread, ExportWorker]:
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
     return thread, worker
+
