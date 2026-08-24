@@ -715,23 +715,23 @@ class MainWindow(QMainWindow):
         body.setObjectName("CoveBody")
         root_vert.addWidget(body, 1)
         root = QVBoxLayout(body)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(10)
+        root.setContentsMargins(10, 7, 10, 7)
+        root.setSpacing(7)
 
         main_split = QSplitter(Qt.Vertical)
         main_split.setChildrenCollapsible(False)
-        main_split.setHandleWidth(6)
+        main_split.setHandleWidth(4)
         root.addWidget(main_split, stretch=1)
 
         preview_panel = QWidget()
         preview_lay = QVBoxLayout(preview_panel)
         preview_lay.setContentsMargins(0, 0, 0, 0)
-        preview_lay.setSpacing(10)
+        preview_lay.setSpacing(7)
 
         # top splitter: bin | preview
         top_split = QSplitter(Qt.Horizontal)
         top_split.setChildrenCollapsible(False)
-        top_split.setHandleWidth(6)
+        top_split.setHandleWidth(4)
 
         self.clip_bin = ClipBin()
         self.clip_bin.assetActivated.connect(self._on_asset_activated)
@@ -817,7 +817,7 @@ class MainWindow(QMainWindow):
         transport_bar = QFrame()
         transport_bar.setObjectName("TransportBar")
         transport = QHBoxLayout(transport_bar)
-        transport.setContentsMargins(10, 8, 10, 8)
+        transport.setContentsMargins(9, 5, 9, 5)
         transport.setSpacing(8)
 
         # Transport cluster: Rewind / Play-Pause / End. Grouped inside a
@@ -905,7 +905,7 @@ class MainWindow(QMainWindow):
         timeline_panel = QWidget()
         timeline_lay = QVBoxLayout(timeline_panel)
         timeline_lay.setContentsMargins(0, 0, 0, 0)
-        timeline_lay.setSpacing(10)
+        timeline_lay.setSpacing(6)
 
         # --- timeline
         self.timeline = TimelineWidget()
@@ -949,7 +949,7 @@ class MainWindow(QMainWindow):
         sb_bar = QFrame()
         sb_bar.setObjectName("ZoomBar")
         sb_row = QHBoxLayout(sb_bar)
-        sb_row.setContentsMargins(12, 7, 12, 7)
+        sb_row.setContentsMargins(12, 4, 12, 4)
         sb_row.setSpacing(8)
         self.timeline_scrollbar = QScrollBar(Qt.Horizontal)
         self.timeline_scrollbar.setRange(0, 0)
@@ -989,7 +989,7 @@ class MainWindow(QMainWindow):
         export_bar = QFrame()
         export_bar.setObjectName("ExportBar")
         bottom = QHBoxLayout(export_bar)
-        bottom.setContentsMargins(14, 10, 14, 10)
+        bottom.setContentsMargins(13, 6, 13, 6)
         bottom.setSpacing(12)
         self.export_type_combo = QComboBox()
         self.export_type_combo.addItem("Project")
@@ -1065,9 +1065,11 @@ class MainWindow(QMainWindow):
         timeline_lay.addWidget(self._log_panel)
 
         main_split.addWidget(timeline_panel)
-        main_split.setStretchFactor(0, 3)
-        main_split.setStretchFactor(1, 1)
-        main_split.setSizes([520, 260])
+        # Give the timeline a fairer share so it isn't crushed when the window
+        # grows — the preview still leads, but the tracks stay usable.
+        main_split.setStretchFactor(0, 5)
+        main_split.setStretchFactor(1, 3)
+        main_split.setSizes([460, 360])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)

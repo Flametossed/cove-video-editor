@@ -124,7 +124,7 @@ class TitleBar(QWidget):
     def __init__(self, window: QMainWindow, *, title: str, version: str) -> None:
         super().__init__()
         self._window = window
-        self.setFixedHeight(44)
+        self.setFixedHeight(38)
         self.setAutoFillBackground(True)
 
         lay = QHBoxLayout(self)

@@ -135,7 +135,7 @@ QPushButton {{
     color: {TEXT};
     border: 1px solid {BORDER};
     border-radius: 6px;
-    padding: 6px 12px;
+    padding: 5px 11px;
     font-weight: 500;
 }}
 QPushButton:hover {{
@@ -156,7 +156,7 @@ QPushButton#PrimaryButton {{
     color: {ACCENT_INK};
     border: 1px solid {ACCENT};
     font-weight: 600;
-    padding: 9px 20px;
+    padding: 8px 18px;
     border-radius: 8px;
 }}
 QPushButton#PrimaryButton:hover {{
@@ -286,8 +286,8 @@ QComboBox {{
     color: {TEXT};
     border: 1px solid {BORDER};
     border-radius: 8px;
-    padding: 7px 12px;
-    padding-right: 32px;
+    padding: 6px 11px;
+    padding-right: 30px;
     font-size: 12.5px;
 }}
 QComboBox:hover {{
