@@ -1200,11 +1200,14 @@ class MainWindow(QMainWindow):
         timeline_lay.addWidget(self._log_panel)
 
         main_split.addWidget(timeline_panel)
-        # Give the timeline a fairer share so it isn't crushed when the window
-        # grows — the preview still leads, but the tracks stay usable.
-        main_split.setStretchFactor(0, 5)
-        main_split.setStretchFactor(1, 3)
-        main_split.setSizes([460, 360])
+        # The timeline's tracks are fixed-height, so the timeline panel only
+        # needs its content height — give ALL extra vertical space to the
+        # preview. This keeps the tracks fully visible without leaving dead
+        # space below them when the window grows (childrenCollapsible=False
+        # still guarantees the panel never shrinks below its content min).
+        main_split.setStretchFactor(0, 1)
+        main_split.setStretchFactor(1, 0)
+        main_split.setSizes([520, 380])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
