@@ -1,5 +1,8 @@
 from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cove_video_editor.clip import Clip, MediaAsset
 from cove_video_editor.exporter import AudioTrack, ExportJob, ExportWorker, _join_filter_labels

@@ -7,8 +7,10 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent,
+    QObject,
     QPoint,
     QRectF,
+    QSettings,
     QSizeF,
     QStandardPaths,
     QThread,
@@ -137,6 +139,26 @@ def export_controls_enabled(
     if audio_only:
         return has_clips or has_added_audio
     return has_clips
+
+
+class GPUProbeWorker(QObject):
+    nvenc_result = Signal(bool)
+    amf_result = Signal(bool)
+    finished = Signal()
+
+    def run(self) -> None:
+        try:
+            nvenc = ff.any_nvenc_available()
+        except Exception:
+            nvenc = False
+        self.nvenc_result.emit(nvenc)
+
+        try:
+            amf = ff.any_amf_available()
+        except Exception:
+            amf = False
+        self.amf_result.emit(amf)
+        self.finished.emit()
 
 
 # ── Inline icon painters for transport / zoom buttons ──────────────────────
@@ -489,10 +511,16 @@ class MainWindow(QMainWindow):
         self._redo_stack: list[dict] = []
         self._undo_limit: int = 80
 
+        self._gpu_probe_thread: QThread | None = None
+        self._gpu_probe_worker: GPUProbeWorker | None = None
+        self._nvenc_available = False
+        self._amf_available = False
+
         self._build_ui()
         self._install_shortcuts()
         self._update_controls_enabled()
         self._check_ffmpeg()
+        self._start_gpu_probe_in_background()
         self.setAcceptDrops(True)
         # Update checker plumbing — populated on demand.
         self._update_thread: QThread | None = None
@@ -990,10 +1018,31 @@ class MainWindow(QMainWindow):
         export_lbl.setObjectName("ExportLabel")
         as_lbl = QLabel("AS")
         as_lbl.setObjectName("ExportLabel")
+        using_lbl = QLabel("USING")
+        using_lbl.setObjectName("ExportLabel")
+        self.export_using_lbl = using_lbl
+
+        self.encoder_combo = QComboBox()
+        self.encoder_combo.setMinimumWidth(180)
+        self.encoder_combo.addItems(ff.ENCODER_OPTIONS)
+        self.encoder_combo.setCurrentText(ff.ENCODER_OPTIONS[0])
+        self.encoder_combo.setToolTip(
+            "Automatic uses your NVIDIA GPU (NVENC) or AMD GPU (AMF) when "
+            "available for much faster encoding, and falls back to the CPU "
+            "otherwise.\nChecking for GPU support…"
+        )
+        s = QSettings("Cove", "Cove Video Editor")
+        saved_enc = s.value("export/encoder", None)
+        if saved_enc and saved_enc in ff.ENCODER_OPTIONS:
+            self.encoder_combo.setCurrentText(str(saved_enc))
+        self.encoder_combo.currentTextChanged.connect(self._on_encoder_combo_changed)
+
         bottom.addWidget(export_lbl)
         bottom.addWidget(self.export_type_combo, stretch=0)
         bottom.addWidget(as_lbl)
         bottom.addWidget(self.format_combo, stretch=0)
+        bottom.addWidget(using_lbl)
+        bottom.addWidget(self.encoder_combo, stretch=0)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -2851,6 +2900,7 @@ class MainWindow(QMainWindow):
             region_start, region_end = self._region_export_range
 
         active_sub = next((s.clone() for s in self._subs if s.active), None)
+        encoder_pref = ff.ENCODER_KEY_MAP.get(self.encoder_combo.currentText(), "auto")
 
         job = ExportJob(
             clips=[c.clone() for c in self._clips],
@@ -2861,6 +2911,7 @@ class MainWindow(QMainWindow):
             region_start=region_start,
             region_end=region_end,
             subtitles=active_sub,
+            encoder_pref=encoder_pref,
         )
 
         self._last_progress = 0
@@ -2966,6 +3017,9 @@ class MainWindow(QMainWindow):
         )
         self.crop_btn.setEnabled(loaded)
         self.format_combo.setEnabled(can_export)
+        is_audio = self._is_audio_only_export()
+        self.encoder_combo.setEnabled(can_export and not is_audio)
+        self.export_using_lbl.setEnabled(can_export and not is_audio)
         self.export_btn.setEnabled(can_export)
         for w in (self.split_btn, self.delete_clip_btn):
             w.setEnabled(has_any)
@@ -3020,6 +3074,8 @@ class MainWindow(QMainWindow):
                     thread.quit(); thread.wait(1500)
         if self._export_thread and self._export_thread.isRunning():
             self._export_thread.quit(); self._export_thread.wait(2000)
+        if hasattr(self, "_gpu_probe_thread") and self._gpu_probe_thread and self._gpu_probe_thread.isRunning():
+            self._gpu_probe_thread.quit(); self._gpu_probe_thread.wait(1500)
         super().closeEvent(event)
 
     def _check_ffmpeg(self) -> None:
@@ -3033,6 +3089,77 @@ class MainWindow(QMainWindow):
                 f"If you are running from source, install ffmpeg with your package "
                 f"manager or drop the binaries next to the app.",
             )
+
+    def _start_gpu_probe_in_background(self) -> None:
+        """Probe NVIDIA (NVENC) and AMD (AMF) hardware encoder support in the background."""
+        thread = QThread()
+        worker = GPUProbeWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.nvenc_result.connect(self._apply_nvenc_availability, Qt.QueuedConnection)
+        worker.amf_result.connect(self._apply_amf_availability, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit, Qt.QueuedConnection)
+        thread.finished.connect(self._on_gpu_probe_done, Qt.QueuedConnection)
+        self._gpu_probe_thread = thread
+        self._gpu_probe_worker = worker
+        thread.start()
+
+    def _on_gpu_probe_done(self) -> None:
+        self._gpu_probe_thread = None
+        self._gpu_probe_worker = None
+
+    def _apply_nvenc_availability(self, available: bool) -> None:
+        """Reflect NVENC detection in the Encoder combo on the UI thread."""
+        self._nvenc_available = bool(available)
+        nvenc_label = ff.ENCODER_OPTIONS[2]  # "NVIDIA GPU (NVENC)"
+        idx = self.encoder_combo.findText(nvenc_label)
+        if idx >= 0:
+            model = self.encoder_combo.model()
+            item = model.item(idx) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(available)
+            if not available and self.encoder_combo.currentIndex() == idx:
+                self.encoder_combo.setCurrentIndex(0)
+        self._refresh_gpu_tooltip()
+
+    def _apply_amf_availability(self, available: bool) -> None:
+        """Reflect AMD AMF detection in the Encoder combo on the UI thread."""
+        self._amf_available = bool(available)
+        amf_label = ff.ENCODER_OPTIONS[3]  # "AMD GPU (AMF)"
+        idx = self.encoder_combo.findText(amf_label)
+        if idx >= 0:
+            model = self.encoder_combo.model()
+            item = model.item(idx) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(available)
+            if not available and self.encoder_combo.currentIndex() == idx:
+                self.encoder_combo.setCurrentIndex(0)
+        self._refresh_gpu_tooltip()
+
+    def _refresh_gpu_tooltip(self) -> None:
+        """Rebuild the Encoder combobox tooltip based on detected hardware."""
+        nvenc = getattr(self, "_nvenc_available", False)
+        amf = getattr(self, "_amf_available", False)
+        parts = []
+        if nvenc:
+            parts.append("NVIDIA (NVENC)")
+        if amf:
+            parts.append("AMD (AMF)")
+        if parts:
+            self.encoder_combo.setToolTip(
+                "Automatic uses " + " and ".join(parts) +
+                " GPU when available for much faster encoding over CPU. "
+                "NVENC is preferred when both are present."
+            )
+        else:
+            self.encoder_combo.setToolTip(
+                "No NVIDIA NVENC or AMD AMF GPU detected on this machine. "
+                "Automatic and CPU both encode on the processor."
+            )
+
+    def _on_encoder_combo_changed(self, text: str) -> None:
+        s = QSettings("Cove", "Cove Video Editor")
+        s.setValue("export/encoder", text)
 
     # --- auto updater ---------------------------------------------------
 

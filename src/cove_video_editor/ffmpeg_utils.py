@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,25 +134,191 @@ def extract_frame_full(video: Path, time: float, out: Path, quality: int = 2) ->
     subprocess.run(cmd, check=True, capture_output=True, **_SUBPROCESS_KWARGS)
 
 
+# ---- Hardware accelerated encoding (NVENC / AMF) ---------------------------
+
+_NVENC_LOCK = threading.Lock()
+_nvenc_cache: dict[str, bool] = {}
+
+_AMF_LOCK = threading.Lock()
+_amf_cache: dict[str, bool] = {}
+
+
+def _probe_nvenc(encoder: str) -> bool:
+    """Return True only if `encoder` is both present in ffmpeg and can actually
+    initialize on this machine (working NVIDIA GPU + driver)."""
+    try:
+        bin_path = require_ffmpeg()
+    except Exception:
+        return False
+    try:
+        listing = subprocess.run(
+            [bin_path, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=15, **_SUBPROCESS_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if encoder not in (listing.stdout or ""):
+        return False
+
+    try:
+        probe_proc = subprocess.run(
+            [bin_path, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
+             "-c:v", encoder, "-f", "null", os.devnull],
+            capture_output=True, text=True, timeout=30, **_SUBPROCESS_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe_proc.returncode == 0
+
+
+def nvenc_available(encoder: str = "hevc_nvenc") -> bool:
+    """Cached: can this machine encode with the given NVENC encoder?"""
+    with _NVENC_LOCK:
+        if encoder in _nvenc_cache:
+            return _nvenc_cache[encoder]
+    result = _probe_nvenc(encoder)
+    with _NVENC_LOCK:
+        _nvenc_cache[encoder] = result
+    return result
+
+
+def any_nvenc_available() -> bool:
+    """True if either NVENC encoder Cove can use (H.265 or H.264) works here."""
+    return nvenc_available("hevc_nvenc") or nvenc_available("h264_nvenc")
+
+
+def _probe_amf(encoder: str) -> bool:
+    """Return True only if `encoder` is both present in ffmpeg and can actually
+    initialize on this machine (working AMD GPU + driver)."""
+    try:
+        bin_path = require_ffmpeg()
+    except Exception:
+        return False
+    try:
+        listing = subprocess.run(
+            [bin_path, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=15, **_SUBPROCESS_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if encoder not in (listing.stdout or ""):
+        return False
+
+    try:
+        probe_proc = subprocess.run(
+            [bin_path, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
+             "-c:v", encoder, "-f", "null", os.devnull],
+            capture_output=True, text=True, timeout=30, **_SUBPROCESS_KWARGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe_proc.returncode == 0
+
+
+def amf_available(encoder: str = "hevc_amf") -> bool:
+    """Cached: can this machine encode with the given AMF encoder?"""
+    with _AMF_LOCK:
+        if encoder in _amf_cache:
+            return _amf_cache[encoder]
+    result = _probe_amf(encoder)
+    with _AMF_LOCK:
+        _amf_cache[encoder] = result
+    return result
+
+
+def any_amf_available() -> bool:
+    """True if either AMF encoder Cove can use (H.265 or H.264) works here."""
+    return amf_available("hevc_amf") or amf_available("h264_amf")
+
+
+# Encoder preference exposed in the UI.
+ENCODER_OPTIONS = [
+    "Automatic (GPU if available)",
+    "CPU (x264 / x265)",
+    "NVIDIA GPU (NVENC)",
+    "AMD GPU (AMF)",
+]
+ENCODER_KEY_MAP = {
+    "Automatic (GPU if available)": "auto",
+    "CPU (x264 / x265)":            "cpu",
+    "NVIDIA GPU (NVENC)":           "nvenc",
+    "AMD GPU (AMF)":                "amf",
+}
+
+
 # ---- Export pipeline ------------------------------------------------------
 
 # Output containers + codec choices. Each entry is:
-#   (display name, file extension, video codec, audio codec, extra args)
+#   (display name, file extension, video codec, audio codec, extra args, optional nvenc/amf codecs)
 # "copy" is used only when no filters touch the stream (fast path).
 EXPORT_FORMATS: dict[str, dict] = {
-    "MP4 (H.264 + AAC)":   {"ext": "mp4",  "vcodec": "libx264",  "acodec": "aac",         "extra": ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]},
-    "MP4 (H.265 + AAC)":   {"ext": "mp4",  "vcodec": "libx265",  "acodec": "aac",         "extra": ["-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-movflags", "+faststart"]},
-    "MKV (H.264 + AAC)":   {"ext": "mkv",  "vcodec": "libx264",  "acodec": "aac",         "extra": ["-pix_fmt", "yuv420p"]},
-    "WebM (VP9 + Opus)":   {"ext": "webm", "vcodec": "libvpx-vp9", "acodec": "libopus",   "extra": ["-b:v", "0", "-crf", "32", "-row-mt", "1"]},
-    "MOV (H.264 + AAC)":   {"ext": "mov",  "vcodec": "libx264",  "acodec": "aac",         "extra": ["-pix_fmt", "yuv420p"]},
-    "AVI (MPEG-4 + MP3)":  {"ext": "avi",  "vcodec": "mpeg4",    "acodec": "libmp3lame",  "extra": ["-qscale:v", "4", "-ar", "44100", "-ac", "2"]},
-    "GIF (animation)":     {"ext": "gif",  "vcodec": "gif",      "acodec": None,           "extra": []},
-    "MP3 (audio only)":    {"ext": "mp3",  "vcodec": None,       "acodec": "libmp3lame",   "extra": ["-q:a", "2"]},
-    "WAV (audio only)":    {"ext": "wav",  "vcodec": None,       "acodec": "pcm_s16le",    "extra": []},
-    "Opus (audio only)":   {"ext": "opus", "vcodec": None,       "acodec": "libopus",      "extra": ["-b:a", "128k"]},
-    "FLAC (audio only)":   {"ext": "flac", "vcodec": None,       "acodec": "flac",         "extra": []},
-    "OGG (audio only)":    {"ext": "ogg",  "vcodec": None,       "acodec": "libvorbis",    "extra": ["-q:a", "5"]},
-    "AAC (audio only)":    {"ext": "m4a",  "vcodec": None,       "acodec": "aac",          "extra": ["-b:a", "192k", "-movflags", "+faststart"]},
+    "MP4 (H.264 + AAC)":   {
+        "ext": "mp4",  "vcodec": "libx264",  "acodec": "aac",
+        "nvenc_codec": "h264_nvenc", "amf_codec": "h264_amf",
+        "extra": ["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+    },
+    "MP4 (H.265 + AAC)":   {
+        "ext": "mp4",  "vcodec": "libx265",  "acodec": "aac",
+        "nvenc_codec": "hevc_nvenc", "amf_codec": "hevc_amf",
+        "extra": ["-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-movflags", "+faststart"],
+    },
+    "MKV (H.264 + AAC)":   {
+        "ext": "mkv",  "vcodec": "libx264",  "acodec": "aac",
+        "nvenc_codec": "h264_nvenc", "amf_codec": "h264_amf",
+        "extra": ["-pix_fmt", "yuv420p"],
+    },
+    "WebM (VP9 + Opus)":   {
+        "ext": "webm", "vcodec": "libvpx-vp9", "acodec": "libopus",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": ["-b:v", "0", "-crf", "32", "-row-mt", "1"],
+    },
+    "MOV (H.264 + AAC)":   {
+        "ext": "mov",  "vcodec": "libx264",  "acodec": "aac",
+        "nvenc_codec": "h264_nvenc", "amf_codec": "h264_amf",
+        "extra": ["-pix_fmt", "yuv420p"],
+    },
+    "AVI (MPEG-4 + MP3)":  {
+        "ext": "avi",  "vcodec": "mpeg4",    "acodec": "libmp3lame",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": ["-qscale:v", "4", "-ar", "44100", "-ac", "2"],
+    },
+    "GIF (animation)":     {
+        "ext": "gif",  "vcodec": "gif",      "acodec": None,
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": [],
+    },
+    "MP3 (audio only)":    {
+        "ext": "mp3",  "vcodec": None,       "acodec": "libmp3lame",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": ["-q:a", "2"],
+    },
+    "WAV (audio only)":    {
+        "ext": "wav",  "vcodec": None,       "acodec": "pcm_s16le",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": [],
+    },
+    "Opus (audio only)":   {
+        "ext": "opus", "vcodec": None,       "acodec": "libopus",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": ["-b:a", "128k"],
+    },
+    "FLAC (audio only)":   {
+        "ext": "flac", "vcodec": None,       "acodec": "flac",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": [],
+    },
+    "OGG (audio only)":    {
+        "ext": "ogg",  "vcodec": None,       "acodec": "libvorbis",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": ["-q:a", "5"],
+    },
+    "AAC (audio only)":    {
+        "ext": "m4a",  "vcodec": None,       "acodec": "aac",
+        "nvenc_codec": None, "amf_codec": None,
+        "extra": ["-b:a", "192k", "-movflags", "+faststart"],
+    },
 }
 
 
