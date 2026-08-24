@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QRegion,
     QShortcut,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -112,9 +114,25 @@ VIDEO_FILTERS = (
 AUDIO_FILTERS = "Audio (*.mp3 *.m4a *.aac *.wav *.ogg *.opus *.flac);;All files (*)"
 IMAGE_FILTERS = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff *.tif);;All files (*)"
 SUB_FILTERS = "Subtitles (*.srt *.vtt *.ass *.ssa);;All files (*)"
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 SUB_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
+# Rounded-corner radius for the frameless window. Windows 11 rounds natively
+# via the DWM; other platforms fall back to a rounded widget mask.
+WINDOW_CORNER_RADIUS = 10
+# Importing a folder (or a dropped folder) can pull in a large number of
+# files — each video/audio needs an ffmpeg probe, so a big folder can take a
+# while. Confirm before importing more than this many at once.
+FOLDER_IMPORT_WARN_THRESHOLD = 50
+# Every extension the library can import — used to pull media out of a
+# dropped / browsed folder without dragging in unrelated files.
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | SUB_EXTS
+# "All media" combines every supported extension so a single browse can pick
+# any file type; the kind-specific filter is offered first per tab.
+ALL_MEDIA_FILTER = (
+    "All media (" + " ".join(f"*{e}" for e in sorted(MEDIA_EXTS)) + ")"
+)
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "cove_icon.png"
@@ -512,6 +530,10 @@ class MainWindow(QMainWindow):
         # pinned to the bottom-right of the window.
         s = self._size_grip.sizeHint()
         self._size_grip.move(self.width() - s.width(), self.height() - s.height())
+        # Keep the rounded-corner mask (non-Windows fallback) in step with
+        # the new size.
+        if getattr(self, "_win_chrome_applied", False):
+            self._update_corner_mask()
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
@@ -523,7 +545,70 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.WindowStateChange:
             if hasattr(self, "titlebar"):
                 self.titlebar.set_maximized(self.isMaximized())
+            # Square corners while maximized, rounded when restored.
+            if getattr(self, "_win_chrome_applied", False):
+                self._update_corner_mask()
         super().changeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        # Apply native Windows 11 rounded corners + a matching border once
+        # the window has a real HWND. Done here (not in __init__) so winId()
+        # returns a valid handle.
+        if not getattr(self, "_win_chrome_applied", False):
+            self._win_chrome_applied = True
+            self._apply_windows_chrome()
+        # Non-Windows platforms round via a widget mask, which must track the
+        # current window size.
+        self._update_corner_mask()
+
+    def _apply_windows_chrome(self) -> None:
+        """Round the window corners and draw a subtle border using the
+        Windows 11 DWM. No-op on other platforms / older Windows; the QSS
+        border remains as a fallback either way."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd = wintypes.HWND(int(self.winId()))
+            dwm = ctypes.windll.dwmapi
+
+            # DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
+            pref = ctypes.c_int(2)
+            dwm.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref),
+            )
+            # DWMWA_BORDER_COLOR = 34, COLORREF 0x00BBGGRR.
+            # Matches theme.BORDER_HI (#27353d) -> R=27 G=35 B=3d.
+            border = ctypes.c_uint(0x003D3527)
+            dwm.DwmSetWindowAttribute(
+                hwnd, 34, ctypes.byref(border), ctypes.sizeof(border),
+            )
+        except Exception:  # noqa: BLE001 — cosmetic only; never block startup
+            pass
+
+    def _update_corner_mask(self) -> None:
+        """Rounded-corner fallback for platforms without the Windows DWM
+        (Linux / others). Clips the frameless window to a rounded rect via a
+        widget mask, which uniformly rounds the title bar, body, and status
+        bar. Windows uses the DWM instead, so this is a no-op there. The mask
+        is cleared while maximized / fullscreen so the window fills the
+        screen with square corners like a normal maximized app."""
+        if sys.platform == "win32":
+            return
+        if self.isMaximized() or self.isFullScreen():
+            self.clearMask()
+            return
+        r = self.rect()
+        radius = WINDOW_CORNER_RADIUS
+        path = QPainterPath()
+        path.addRoundedRect(
+            float(r.x()), float(r.y()), float(r.width()), float(r.height()),
+            radius, radius,
+        )
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
     # --- shortcuts -----------------------------------------------------
 
@@ -737,6 +822,7 @@ class MainWindow(QMainWindow):
         self.clip_bin.assetActivated.connect(self._on_asset_activated)
         self.clip_bin.assetDeleteRequested.connect(self._on_asset_delete_requested)
         self.clip_bin.filesDropped.connect(self._on_bin_files_dropped)
+        self.clip_bin.browseRequested.connect(self._on_browse_requested)
         self.clip_bin.subActivated.connect(self._on_sub_activated)
         self.clip_bin.subDeleteRequested.connect(self._on_sub_delete_requested)
         self.clip_bin.subStyleRequested.connect(self._on_sub_style_requested)
@@ -1081,7 +1167,12 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
             return
         if md.hasUrls():
-            paths = [Path(u.toLocalFile()) for u in md.urls() if u.toLocalFile()]
+            dropped = [Path(u.toLocalFile()) for u in md.urls() if u.toLocalFile()]
+            # Expand any dropped folders into the media files they contain.
+            paths = self._expand_media_paths(dropped)
+            if paths and not self._confirm_bulk_import(len(paths)):
+                event.acceptProposedAction()
+                return
             audio_paths = [p for p in paths if p.suffix.lower() in AUDIO_EXTS]
             other_paths = [p for p in paths if p.suffix.lower() not in AUDIO_EXTS]
             if other_paths:
@@ -1427,7 +1518,66 @@ class MainWindow(QMainWindow):
     def _on_bin_files_dropped(self, paths: list) -> None:
         # Import into the library only — don't auto-append videos to the
         # timeline. User drags to timeline explicitly when they want them.
-        self._import_paths([Path(p) for p in paths if p], append_to_timeline=False)
+        expanded = self._expand_media_paths([Path(p) for p in paths if p])
+        if expanded and self._confirm_bulk_import(len(expanded)):
+            self._import_paths(expanded, append_to_timeline=False)
+
+    # --- click-to-browse (media panel) --------------------------------
+
+    @staticmethod
+    def _expand_media_paths(paths: list[Path]) -> list[Path]:
+        """Flatten a mix of files and folders into a list of importable
+        media files. Folders are searched recursively; only extensions the
+        library understands are kept so unrelated files aren't pulled in."""
+        out: list[Path] = []
+        for p in paths:
+            try:
+                if p.is_dir():
+                    for f in sorted(p.rglob("*")):
+                        if f.is_file() and f.suffix.lower() in MEDIA_EXTS:
+                            out.append(f)
+                elif p.is_file():
+                    out.append(p)
+            except OSError:
+                continue
+        return out
+
+    def _on_browse_requested(self, kind: str) -> None:
+        """Empty media-panel area was clicked. Open the native OS file
+        picker (regular Windows Explorer) so the user can select one or many
+        files. Whole folders are imported by dragging them in — the native
+        dialog can't select files and folders together."""
+        kind_filter = {
+            "video": VIDEO_FILTERS,
+            "audio": AUDIO_FILTERS,
+            "image": IMAGE_FILTERS,
+            "sub": SUB_FILTERS,
+        }.get(kind, ALL_MEDIA_FILTER)
+        # Lead with the clicked tab's own type, then a catch-all, then all.
+        filters = ";;".join([kind_filter, ALL_MEDIA_FILTER, "All files (*)"])
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add media files", "", filters,
+        )
+        files = [Path(p) for p in paths if p]
+        if not files:
+            return
+        self._import_paths(files, append_to_timeline=False)
+        self.status.showMessage(f"Imported {len(files)} file(s).", 5000)
+
+    def _confirm_bulk_import(self, count: int) -> bool:
+        """Ask before importing a large batch (e.g. a big folder). Small
+        imports proceed silently. Returns True to go ahead."""
+        if count <= FOLDER_IMPORT_WARN_THRESHOLD:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Import many files?",
+            f"This will import {count} media files. Probing that many can "
+            f"take a while.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
     def _on_asset_delete_requested(self, asset_id: str) -> None:
         asset = self._assets.get(asset_id)

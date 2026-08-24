@@ -47,6 +47,7 @@ class AssetList(QListWidget):
 
     deleteRequested = Signal(str)        # asset id
     filesDropped = Signal(list)          # list[str]
+    browseRequested = Signal()           # clicked empty area — open a file/folder picker
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -92,6 +93,32 @@ class AssetList(QListWidget):
                     event.accept()
                     return
         super().keyPressEvent(event)
+
+    # --- click empty area to browse -------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        # Remember where an empty-area left-press started so a plain click
+        # (no drag) can open the file/folder picker on release.
+        self._press_on_empty = (
+            event.button() == Qt.LeftButton
+            and self.itemAt(event.position().toPoint()) is None
+        )
+        self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+        if (
+            getattr(self, "_press_on_empty", False)
+            and event.button() == Qt.LeftButton
+            and self.itemAt(event.position().toPoint()) is None
+            and (event.position().toPoint() - self._press_pos).manhattanLength() < 6
+        ):
+            self._press_on_empty = False
+            self.browseRequested.emit()
+            event.accept()
+            return
+        self._press_on_empty = False
+        super().mouseReleaseEvent(event)
 
     # --- outgoing drag (item -> timeline) -------------------------------
 
@@ -198,12 +225,12 @@ class AssetList(QListWidget):
             p.setPen(theme.C_TEXT_2 if not self._drop_highlight else theme.C_ACCENT)
             f = p.font(); f.setPointSize(10); p.setFont(f)
             text_rect = QRect(0, cy + box_h // 2 - 10, vp.width(), 40)
-            p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, "Drop files or folders")
+            p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, "Click to browse for files")
             p.setPen(theme.C_TEXT_3)
             p.drawText(
                 QRect(0, cy + box_h // 2 + 10, vp.width(), 24),
                 Qt.AlignHCenter | Qt.AlignTop,
-                "or drag onto the timeline",
+                "or drop files or folders here",
             )
         p.end()
 
@@ -220,6 +247,7 @@ class ClipBin(QWidget):
     assetDeleteRequested = Signal(str)      # Delete / Backspace on an asset
     subDeleteRequested = Signal(str)        # Delete / Backspace on a subtitle row
     filesDropped = Signal(list)             # list[str] — dropped from OS
+    browseRequested = Signal(str)           # kind ("video"/"audio"/"image"/"sub")
     subActivated = Signal(str)              # subtitle id (double-click = make active)
     subStyleRequested = Signal()            # open style dialog
     subSyncRequested = Signal()             # open auto-sync / offset dialog
@@ -257,10 +285,15 @@ class ClipBin(QWidget):
         self.video_list = AssetList()
         self.audio_list = AssetList()
         self.image_list = AssetList()
-        for lst in (self.video_list, self.audio_list, self.image_list):
+        for lst, kind in (
+            (self.video_list, "video"),
+            (self.audio_list, "audio"),
+            (self.image_list, "image"),
+        ):
             lst.itemDoubleClicked.connect(self._on_activated)
             lst.deleteRequested.connect(self.assetDeleteRequested)
             lst.filesDropped.connect(self.filesDropped)
+            lst.browseRequested.connect(lambda k=kind: self.browseRequested.emit(k))
         # Subs tab: a list of uploaded .srt/.vtt files with a small style
         # button up top. The AssetList for subs emits `deleteRequested` via
         # a dedicated signal so app.py can distinguish sub deletions from
@@ -269,6 +302,7 @@ class ClipBin(QWidget):
         self.subs_list.itemDoubleClicked.connect(self._on_sub_activated)
         self.subs_list.deleteRequested.connect(self.subDeleteRequested)
         self.subs_list.filesDropped.connect(self.filesDropped)
+        self.subs_list.browseRequested.connect(lambda: self.browseRequested.emit("sub"))
         self._sub_tab = self._build_subs_tab()
 
         # Keep references so we can relabel based on item counts. Short
