@@ -9,12 +9,23 @@ HANDLE_SIZE = 10
 HIT_PAD = 14
 MIN_NORMALIZED = 0.05
 
+CROP_ASPECT_PRESETS: dict[str, float | None] = {
+    "Free (Custom)": None,
+    "16:9 (Landscape / YouTube)": 16 / 9,
+    "9:16 (TikTok / Reels / Shorts)": 9 / 16,
+    "1:1 (Square / Instagram)": 1.0,
+    "4:5 (Portrait / Social)": 4 / 5,
+    "4:3 (Standard / Classic)": 4 / 3,
+    "21:9 (Cinematic / Ultrawide)": 21 / 9,
+}
+
 
 class CropOverlay(QWidget):
     """Draggable crop rectangle in normalized 0..1 source coords.
 
     Renders on top of a video widget, accounts for letterboxing so the rect
     always tracks the actual video pixels rather than the widget area.
+    Supports locking to standard aspect ratio presets (16:9, 9:16, 1:1, etc.).
     """
 
     cropChanged = Signal(QRectF)
@@ -23,6 +34,8 @@ class CropOverlay(QWidget):
         super().__init__(parent)
         self.setMouseTracking(True)
         self._video_aspect: float = 16 / 9
+        self._aspect_lock: float | None = None
+        self._preset_name: str = "Free (Custom)"
         self._rect_norm: QRectF = QRectF(0.0, 0.0, 1.0, 1.0)
         self._drag_target: str | None = None
         self._drag_start_widget: QPointF | None = None
@@ -31,7 +44,38 @@ class CropOverlay(QWidget):
     def set_video_aspect(self, aspect: float) -> None:
         if aspect > 0:
             self._video_aspect = aspect
+            if self._aspect_lock is not None:
+                self.set_aspect_ratio_preset(self._aspect_lock, self._preset_name)
             self.update()
+
+    def set_aspect_ratio_preset(
+        self, aspect_target: float | None, preset_name: str = "",
+    ) -> None:
+        """Set or clear the aspect ratio lock.
+
+        aspect_target: target pixel aspect ratio (e.g. 16/9, 9/16, 1.0) or None for Free.
+        Automatically fits and centers a maximum-area crop rectangle within 0..1 bounds.
+        """
+        self._aspect_lock = aspect_target
+        self._preset_name = preset_name or ("Free (Custom)" if aspect_target is None else f"{aspect_target:.2f}")
+        if aspect_target is not None and self._video_aspect > 0:
+            norm_ar = aspect_target / self._video_aspect
+            if norm_ar <= 1.0:
+                h = 1.0
+                w = max(MIN_NORMALIZED, norm_ar)
+            else:
+                w = 1.0
+                h = max(MIN_NORMALIZED, 1.0 / norm_ar)
+            x = max(0.0, (1.0 - w) / 2.0)
+            y = max(0.0, (1.0 - h) / 2.0)
+            self._rect_norm = QRectF(x, y, w, h)
+            self.update()
+            self.cropChanged.emit(self.normalized_rect())
+        else:
+            self.update()
+
+    def aspect_ratio_preset(self) -> float | None:
+        return self._aspect_lock
 
     def set_normalized_rect(self, rect: QRectF) -> None:
         self._rect_norm = self._clamp(QRectF(rect))
@@ -41,6 +85,8 @@ class CropOverlay(QWidget):
         return QRectF(self._rect_norm)
 
     def reset(self) -> None:
+        self._aspect_lock = None
+        self._preset_name = "Free (Custom)"
         self._rect_norm = QRectF(0.0, 0.0, 1.0, 1.0)
         self.update()
         self.cropChanged.emit(self.normalized_rect())
@@ -111,17 +157,31 @@ class CropOverlay(QWidget):
             y = c.top() + c.height() * i / 3
             p.drawLine(QPointF(c.left(), y), QPointF(c.right(), y))
 
-        border_pen = QPen(QColor("#5fb4ff"))
+        border_pen = QPen(QColor("#5eead4"))
         border_pen.setWidth(2)
         p.setPen(border_pen)
         p.setBrush(Qt.NoBrush)
         p.drawRect(c)
 
-        p.setBrush(QColor("#5fb4ff"))
+        p.setBrush(QColor("#5eead4"))
         p.setPen(QPen(QColor("#0d1216"), 1))
         s = HANDLE_SIZE
         for pt in self._handle_centers(c).values():
             p.drawRect(QRectF(pt.x() - s / 2, pt.y() - s / 2, s, s))
+
+        # Render aspect ratio tag pill on top-left of crop box if locked
+        if self._preset_name and self._preset_name != "Free (Custom)":
+            short_tag = self._preset_name.split(" ")[0]
+            from PySide6.QtGui import QFont
+            p.setFont(QFont("Inter", 9, QFont.Bold))
+            fm = p.fontMetrics()
+            tw = fm.horizontalAdvance(short_tag)
+            badge_rect = QRectF(c.left() + 8, c.top() + 8, tw + 14, 20)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(11, 16, 19, 210))
+            p.drawRoundedRect(badge_rect, 4, 4)
+            p.setPen(QColor("#5eead4"))
+            p.drawText(badge_rect, Qt.AlignCenter, short_tag)
 
         p.end()
 
@@ -162,12 +222,76 @@ class CropOverlay(QWidget):
             return
         dx = (pos.x() - self._drag_start_widget.x()) / v.width()
         dy = (pos.y() - self._drag_start_widget.y()) / v.height()
-        r = QRectF(self._drag_start_rect)
+        orig = QRectF(self._drag_start_rect)
         target = self._drag_target
 
         if target == "move":
+            r = QRectF(orig)
             r.translate(dx, dy)
+            self._rect_norm = self._clamp(r)
+        elif self._aspect_lock is not None and self._video_aspect > 0:
+            norm_ar = self._aspect_lock / self._video_aspect
+            min_w = MIN_NORMALIZED * norm_ar if norm_ar >= 1 else MIN_NORMALIZED
+            min_h = min_w / norm_ar
+
+            if target == "br":
+                max_w = min(1.0 - orig.left(), (1.0 - orig.top()) * norm_ar)
+                delta_w = dx if abs(dx) >= abs(dy * norm_ar) else dy * norm_ar
+                w = max(min_w, min(max_w, orig.width() + delta_w))
+                h = w / norm_ar
+                r = QRectF(orig.left(), orig.top(), w, h)
+            elif target == "tl":
+                max_w = min(orig.right(), orig.bottom() * norm_ar)
+                delta_w = -dx if abs(dx) >= abs(dy * norm_ar) else -dy * norm_ar
+                w = max(min_w, min(max_w, orig.width() + delta_w))
+                h = w / norm_ar
+                r = QRectF(orig.right() - w, orig.bottom() - h, w, h)
+            elif target == "tr":
+                max_w = min(1.0 - orig.left(), orig.bottom() * norm_ar)
+                delta_w = dx if abs(dx) >= abs(dy * norm_ar) else -dy * norm_ar
+                w = max(min_w, min(max_w, orig.width() + delta_w))
+                h = w / norm_ar
+                r = QRectF(orig.left(), orig.bottom() - h, w, h)
+            elif target == "bl":
+                max_w = min(orig.right(), (1.0 - orig.top()) * norm_ar)
+                delta_w = -dx if abs(dx) >= abs(dy * norm_ar) else dy * norm_ar
+                w = max(min_w, min(max_w, orig.width() + delta_w))
+                h = w / norm_ar
+                r = QRectF(orig.right() - w, orig.top(), w, h)
+            elif target == "r":
+                max_w = min(1.0 - orig.left(), norm_ar)
+                w = max(min_w, min(max_w, orig.width() + dx))
+                h = w / norm_ar
+                cy = (orig.top() + orig.bottom()) / 2.0
+                top = max(0.0, min(1.0 - h, cy - h / 2.0))
+                r = QRectF(orig.left(), top, w, h)
+            elif target == "l":
+                max_w = min(orig.right(), norm_ar)
+                w = max(min_w, min(max_w, orig.width() - dx))
+                h = w / norm_ar
+                cy = (orig.top() + orig.bottom()) / 2.0
+                top = max(0.0, min(1.0 - h, cy - h / 2.0))
+                r = QRectF(orig.right() - w, top, w, h)
+            elif target == "b":
+                max_h = min(1.0 - orig.top(), 1.0 / norm_ar)
+                h = max(min_h, min(max_h, orig.height() + dy))
+                w = h * norm_ar
+                cx = (orig.left() + orig.right()) / 2.0
+                left = max(0.0, min(1.0 - w, cx - w / 2.0))
+                r = QRectF(left, orig.top(), w, h)
+            elif target == "t":
+                max_h = min(orig.bottom(), 1.0 / norm_ar)
+                h = max(min_h, min(max_h, orig.height() - dy))
+                w = h * norm_ar
+                cx = (orig.left() + orig.right()) / 2.0
+                left = max(0.0, min(1.0 - w, cx - w / 2.0))
+                r = QRectF(left, orig.bottom() - h, w, h)
+            else:
+                r = orig
+
+            self._rect_norm = self._clamp(r)
         else:
+            r = QRectF(orig)
             if "l" in target:
                 r.setLeft(min(r.right() - MIN_NORMALIZED, r.left() + dx))
             if "r" in target:
@@ -176,8 +300,8 @@ class CropOverlay(QWidget):
                 r.setTop(min(r.bottom() - MIN_NORMALIZED, r.top() + dy))
             if "b" in target:
                 r.setBottom(max(r.top() + MIN_NORMALIZED, r.bottom() + dy))
+            self._rect_norm = self._clamp(r)
 
-        self._rect_norm = self._clamp(r)
         self.update()
 
     def _clamp(self, r: QRectF) -> QRectF:
