@@ -984,6 +984,10 @@ class MainWindow(QMainWindow):
         self.crop_aspect_combo.setCurrentText("Free (Custom)")
         self.crop_aspect_combo.setVisible(False)
         self.crop_aspect_combo.currentTextChanged.connect(self._on_crop_aspect_changed)
+        self.crop_fit_btn = QPushButton("Fit to canvas")
+        self.crop_fit_btn.setToolTip("Fit and center crop box to the full canvas bounds")
+        self.crop_fit_btn.setVisible(False)
+        self.crop_fit_btn.clicked.connect(self._on_crop_fit_clicked)
         self.crop_reset_btn = QPushButton("Reset crop")
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
@@ -997,6 +1001,7 @@ class MainWindow(QMainWindow):
         transport.addSpacing(4)
         transport.addWidget(self.crop_btn)
         transport.addWidget(self.crop_aspect_combo)
+        transport.addWidget(self.crop_fit_btn)
         transport.addWidget(self.crop_reset_btn)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
@@ -2856,6 +2861,7 @@ class MainWindow(QMainWindow):
         self.crop_overlay.setVisible(checked)
         self.crop_overlay.raise_()
         self.crop_aspect_combo.setVisible(checked)
+        self.crop_fit_btn.setVisible(checked)
         self.crop_reset_btn.setVisible(checked)
 
     def _on_crop_aspect_changed(self, preset_name: str) -> None:
@@ -2864,6 +2870,12 @@ class MainWindow(QMainWindow):
             self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
         ratio = CROP_ASPECT_PRESETS.get(preset_name)
         self.crop_overlay.set_aspect_ratio_preset(ratio, preset_name)
+
+    def _on_crop_fit_clicked(self) -> None:
+        c = self._selected_clip()
+        if c:
+            self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
+        self.crop_overlay.fit_to_canvas()
 
     def _on_crop_reset(self) -> None:
         self.crop_aspect_combo.blockSignals(True)

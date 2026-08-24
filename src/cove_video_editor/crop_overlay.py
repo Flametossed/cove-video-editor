@@ -91,6 +91,30 @@ class CropOverlay(QWidget):
         self.update()
         self.cropChanged.emit(self.normalized_rect())
 
+    def fit_to_canvas(self) -> None:
+        """Fit and center the crop rectangle to the maximum bounds on the canvas.
+
+        If an aspect ratio preset is active, maximizes that ratio within 0..1.
+        If in Free mode, fills the entire canvas (0.0, 0.0, 1.0, 1.0).
+        """
+        if self._aspect_lock is not None and self._video_aspect > 0:
+            norm_ar = self._aspect_lock / self._video_aspect
+            if norm_ar <= 1.0:
+                h = 1.0
+                w = max(MIN_NORMALIZED, norm_ar)
+            else:
+                w = 1.0
+                h = max(MIN_NORMALIZED, 1.0 / norm_ar)
+            x = max(0.0, (1.0 - w) / 2.0)
+            y = max(0.0, (1.0 - h) / 2.0)
+            self._rect_norm = QRectF(x, y, w, h)
+            self.update()
+            self.cropChanged.emit(self.normalized_rect())
+        else:
+            self._rect_norm = QRectF(0.0, 0.0, 1.0, 1.0)
+            self.update()
+            self.cropChanged.emit(self.normalized_rect())
+
     def _video_display_rect(self) -> QRectF:
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:

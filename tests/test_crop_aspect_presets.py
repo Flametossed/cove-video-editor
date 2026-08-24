@@ -136,6 +136,29 @@ class TestCropAspectPresets(unittest.TestCase):
         self.assertIsNone(self.overlay.aspect_ratio_preset())
         self.assertEqual(self.overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0))
 
+    def test_fit_to_canvas_with_preset_and_free_mode(self) -> None:
+        """fit_to_canvas() maximizes aspect crop within canvas or full 0..1 in free mode."""
+        self.overlay.set_video_aspect(16 / 9)
+        self.overlay.set_aspect_ratio_preset(9 / 16, "9:16 (TikTok / Reels / Shorts)")
+
+        # Move/shrink it arbitrarily
+        self.overlay.set_normalized_rect(QRectF(0.2, 0.2, 0.2, 0.2))
+
+        # Call fit_to_canvas
+        self.overlay.fit_to_canvas()
+        r = self.overlay.normalized_rect()
+        expected_norm_ar = (9 / 16) / (16 / 9)
+        self.assertAlmostEqual(r.height(), 1.0, places=4)
+        self.assertAlmostEqual(r.width(), expected_norm_ar, places=4)
+        self.assertAlmostEqual(r.x(), (1.0 - expected_norm_ar) / 2.0, places=4)
+        self.assertAlmostEqual(r.y(), 0.0, places=4)
+
+        # In free mode:
+        self.overlay.reset()
+        self.overlay.set_normalized_rect(QRectF(0.1, 0.1, 0.5, 0.5))
+        self.overlay.fit_to_canvas()
+        self.assertEqual(self.overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0))
+
 
 if __name__ == "__main__":
     unittest.main()
