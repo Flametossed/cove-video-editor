@@ -928,6 +928,8 @@ class MainWindow(QMainWindow):
         self.timeline.clipDoubleClicked.connect(self._open_clip_properties)
         self.timeline.audioLinkToggled.connect(self._on_audio_link_toggled)
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
+        self.timeline.clipMoveToStartRequested.connect(self._on_clip_move_to_start)
+        self.timeline.clipMoveToPlayheadRequested.connect(self._on_clip_move_to_playhead)
         self.timeline.audioOffsetChanged.connect(self._on_audio_offset_changed)
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
         self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
@@ -1985,6 +1987,56 @@ class MainWindow(QMainWindow):
 
     def _on_clip_delete_requested(self, clip_id: str) -> None:
         self._delete_clip_by_id(clip_id)
+
+    def _on_clip_move_to_start(self, clip_id: str) -> None:
+        self._ripple_move_clip(clip_id, 0.0)
+
+    def _on_clip_move_to_playhead(self, clip_id: str) -> None:
+        self._ripple_move_clip(clip_id, self.timeline.playhead())
+
+    def _ripple_move_clip(self, clip_id: str, target_start: float) -> None:
+        """Reposition a clip to `target_start`, rippling the other clips so the
+        sequence stays gap-consistent: the gap the clip vacates closes, and a
+        gap opens at the target. This is the zero-drag way to send a spliced
+        middle piece to the start (or the playhead) without dragging it across
+        the whole timeline.
+
+        The target is snapped to the nearest clean cut point (a neighbouring
+        clip edge or t=0), because a single video track can't hold overlapping
+        clips — inserting mid-clip would otherwise collide."""
+        clip = next((c for c in self._clips if c.id == clip_id), None)
+        if clip is None:
+            return
+        target_start = max(0.0, target_start)
+        length = clip.timeline_length
+        old = clip.timeline_start
+        # Positions the other clips take once this clip is pulled out (its gap
+        # closes), and the set of clean cut points available for insertion.
+        others = [c for c in self._clips if c.id != clip_id]
+        adjusted: list[tuple[Clip, float]] = []
+        boundaries: set[float] = {0.0}
+        for c in others:
+            ns = max(0.0, c.timeline_start - (length if c.timeline_start > old else 0.0))
+            adjusted.append((c, ns))
+            boundaries.add(ns)
+            boundaries.add(ns + c.timeline_length)
+        target = min(boundaries, key=lambda b: abs(b - target_start))
+        if abs(target - old) < 1e-4:
+            return  # already at that cut point
+        self._snapshot()
+        for c, ns in adjusted:
+            # Open a gap at the target: clips at/after it shift right by length.
+            if ns >= target - 1e-6:
+                ns += length
+            c.timeline_start = max(0.0, ns)
+        clip.timeline_start = target
+        self._clips = sort_clips(self._clips)
+        self.timeline.set_clips(self._clips)
+        self.timeline.select_clip(clip_id)
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        self._drive_main_player_from_playhead()
+        self.status.showMessage("Clip moved.", 2000)
 
     def _delete_clip_by_id(self, clip_id: str) -> None:
         if not any(c.id == clip_id for c in self._clips):
