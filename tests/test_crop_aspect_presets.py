@@ -159,6 +159,30 @@ class TestCropAspectPresets(unittest.TestCase):
         self.overlay.fit_to_canvas()
         self.assertEqual(self.overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0))
 
+    def test_fit_modes_behavior(self) -> None:
+        """Verify fill, fit, and stretch modes in CropOverlay."""
+        self.overlay.set_video_aspect(16 / 9)
+        self.overlay.set_aspect_ratio_preset(9 / 16, "9:16 (TikTok / Reels / Shorts)")
+
+        self.assertEqual(self.overlay.fit_mode(), "fill")
+        self.assertNotEqual(self.overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0))
+
+        # Switch to Fit (Letterbox) mode
+        self.overlay.set_fit_mode("fit")
+        self.assertEqual(self.overlay.fit_mode(), "fit")
+        self.assertEqual(self.overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0))
+        self.assertIsNone(self.overlay._hit_test(QPointF(100, 100)))
+
+        # Switch to Stretch mode
+        self.overlay.set_fit_mode("stretch")
+        self.assertEqual(self.overlay.fit_mode(), "stretch")
+        self.assertEqual(self.overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0))
+
+        # Switch back to Fill mode
+        self.overlay.set_fit_mode("fill")
+        self.assertEqual(self.overlay.fit_mode(), "fill")
+        self.assertAlmostEqual(self.overlay.normalized_rect().height(), 1.0, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

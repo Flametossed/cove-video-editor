@@ -58,6 +58,10 @@ class ExportJob:
     # SubtitleTrack is applied to the concat'd video output via the
     # `subtitles=` filter before final mapping.
     subtitles: SubtitleTrack | None = None
+    # Canvas fitting mode: "fill" (crop to fill canvas), "fit" (pad/letterbox to keep proportions), "stretch" (stretch to fill canvas)
+    canvas_fit: str = "fill"
+    # Target canvas aspect ratio (e.g. 9/16, 16/9, 1.0)
+    canvas_aspect: float | None = None
 
     @property
     def total_timeline(self) -> float:
@@ -152,9 +156,25 @@ class ExportWorker(QObject):
         timeline_end = sequence_length(clips) if clips else _audio_only_duration(job.audio_tracks)
         segments = _segments_with_gaps(clips, timeline_end)
 
-        # Output size: honor crop, else take from first real clip, else 1280x720
+        # Output size: honor crop/aspect/fit, else take from first real clip, else 1280x720
         first_real = next((c for c in clips if c.asset.width > 0), None)
-        if job.crop:
+        base_w = first_real.asset.width if first_real else 1280
+        base_h = first_real.asset.height if first_real else 720
+
+        if job.crop and job.canvas_fit == "fill":
+            _, _, tgt_w, tgt_h = job.crop
+        elif job.canvas_aspect is not None and job.canvas_aspect > 0:
+            target_ar = job.canvas_aspect
+            base_ar = base_w / max(1, base_h)
+            if target_ar < base_ar:
+                # Target is taller/narrower (e.g. 9:16 from 16:9)
+                tgt_h = base_h
+                tgt_w = int(round(base_h * target_ar))
+            else:
+                # Target is wider (e.g. 16:9 from 9:16)
+                tgt_w = base_w
+                tgt_h = int(round(base_w / target_ar))
+        elif job.crop:
             _, _, tgt_w, tgt_h = job.crop
         elif job.width and job.height:
             tgt_w, tgt_h = job.width, job.height
@@ -162,8 +182,8 @@ class ExportWorker(QObject):
             tgt_w, tgt_h = first_real.asset.width, first_real.asset.height
         else:
             tgt_w, tgt_h = 1280, 720
-        tgt_w -= tgt_w % 2
-        tgt_h -= tgt_h % 2
+        tgt_w = max(2, tgt_w - (tgt_w % 2))
+        tgt_h = max(2, tgt_h - (tgt_h % 2))
 
         cmd: list[str] = [ff.require_ffmpeg(), "-nostdin", "-y", "-hide_banner",
                           "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
@@ -257,34 +277,36 @@ class ExportWorker(QObject):
                 inp = clip_inputs[c.id]
                 is_image = c.asset.kind == "image"
                 if not is_audio_only:
-                    if is_image:
-                        # Image input is already the right length (`-t`),
-                        # so trim/setpts is unnecessary — just normalize
-                        # pts to 0 and run through crop/scale/pad.
-                        vchain = ["setpts=PTS-STARTPTS"]
-                        if job.crop:
-                            x, y, w, h = job.crop
-                            vchain.append(f"crop={w}:{h}:{x}:{y}")
+                    vchain = ["setpts=PTS-STARTPTS"] if is_image else [
+                        f"trim=start={c.src_start:.3f}:end={c.src_end:.3f}",
+                        "setpts=PTS-STARTPTS",
+                    ]
+
+                    if job.crop and job.canvas_fit == "fill":
+                        x, y, w, h = job.crop
+                        vchain.append(f"crop={w}:{h}:{x}:{y}")
                         vchain.append(
                             f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
                             f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
                         )
-                        # yuv420p normalizes the pixel format so concat with
-                        # neighbouring video clips doesn't fail when the
-                        # source image is RGBA/RGB24.
-                        vchain.append("format=yuv420p")
+                    elif job.canvas_fit == "stretch":
+                        vchain.append(f"scale={tgt_w}:{tgt_h}")
+                    elif job.canvas_fit == "fill" and job.canvas_aspect is not None:
+                        vchain.append(
+                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=increase,"
+                            f"crop={tgt_w}:{tgt_h}"
+                        )
                     else:
-                        vchain = [f"trim=start={c.src_start:.3f}:end={c.src_end:.3f}",
-                                  "setpts=PTS-STARTPTS"]
-                        if job.crop:
-                            x, y, w, h = job.crop
-                            vchain.append(f"crop={w}:{h}:{x}:{y}")
+                        # Default "fit" (letterbox / pillarbox with black bars preserving proportions)
                         vchain.append(
                             f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
                             f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
                         )
-                        if abs(c.speed - 1.0) > 1e-6:
-                            vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
+
+                    if is_image:
+                        vchain.append("format=yuv420p")
+                    elif abs(c.speed - 1.0) > 1e-6:
+                        vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
                     parts.append(f"[{inp}:v]" + ",".join(vchain) + f"[v{i}]")
                     v_labels.append(f"v{i}")
                 if needs_audio:
