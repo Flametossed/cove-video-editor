@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -32,7 +33,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QMenu, QWidget
+from PySide6.QtWidgets import QInputDialog, QMenu, QWidget
 
 from . import theme
 from .clip import AddedAudio, Clip, sequence_length, sort_clips
@@ -111,6 +112,8 @@ class TimelineWidget(QWidget):
     clipsChanged = Signal()                       # clip list replaced (for the minimap)
     audioOffsetChanged = Signal(str, float)       # clip id, new audio_offset (seconds)
     clipAudioRemoveRequested = Signal(str)        # clip id — delete clip's audio only
+    clipAudioVolumeChanged = Signal(str, float)   # clip id, new volume (0.0 - 2.0)
+    addedAudioVolumeChanged = Signal(str, float)  # audio id, new volume (0.0 - 2.0)
     scrollRangeChanged = Signal(int, int)         # scroll_max, page (in px)
     scrollValueChanged = Signal(int)              # current scroll_x (in px)
     pixelsPerSecondChanged = Signal(float)        # emitted when zoom level changes
@@ -691,6 +694,19 @@ class TimelineWidget(QWidget):
             if c.waveform_peaks and c.waveform_rate > 0:
                 self._draw_clip_waveform(p, c, r, r_vis, theme.C_ACCENT)
 
+            if c.muted or abs(c.audio_volume - 1.0) > 0.01:
+                badge = "Muted" if c.muted else f"{int(round(c.audio_volume * 100))}%"
+                p.setFont(QFont("Inter", 8, QFont.Bold))
+                fm = p.fontMetrics()
+                bw = fm.horizontalAdvance(badge) + 8
+                bh = 14
+                b_rect = QRect(r_vis.right() - bw - 4, r_vis.top() + 4, bw, bh)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(11, 16, 19, 210))
+                p.drawRoundedRect(b_rect, 3, 3)
+                p.setPen(theme.C_DANGER if c.muted else theme.C_ACCENT)
+                p.drawText(b_rect, Qt.AlignCenter, badge)
+
             audio_selected = c.id == self._selected_audio_clip_id
             if audio_selected:
                 color = theme.C_WARN  # dragged/selected unlinked audio
@@ -737,7 +753,24 @@ class TimelineWidget(QWidget):
                     p, audio.peaks, audio.rate,
                     tile, tile_vis, audio.src_span, theme.C_WARN,
                     src_start=audio.src_start,
+                    volume=getattr(audio, "volume", 1.0),
+                    muted=getattr(audio, "muted", False),
                 )
+
+            if getattr(audio, "muted", False) or abs(getattr(audio, "volume", 1.0) - 1.0) > 0.01:
+                is_m = getattr(audio, "muted", False)
+                badge = "Muted" if is_m else f"{int(round(getattr(audio, 'volume', 1.0) * 100))}%"
+                p.setFont(QFont("Inter", 8, QFont.Bold))
+                fm = p.fontMetrics()
+                bw = fm.horizontalAdvance(badge) + 8
+                bh = 14
+                b_rect = QRect(tile_vis.right() - bw - 4, tile_vis.top() + 4, bw, bh)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(11, 16, 19, 210))
+                p.drawRoundedRect(b_rect, 3, 3)
+                p.setPen(theme.C_DANGER if is_m else theme.C_WARN)
+                p.drawText(b_rect, Qt.AlignCenter, badge)
+
             selected = audio.id == self._added_audio_selected_id
             if selected:
                 pen = QPen(theme.C_WARN)
@@ -770,6 +803,12 @@ class TimelineWidget(QWidget):
 
         cy = r.center().y()
         half_h = max(1, r.height() // 2 - 2)
+
+        vol = 0.0 if c.muted else c.audio_volume
+        if vol <= 0.001:
+            p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 50), 1))
+            p.drawLine(r_vis.left(), cy, r_vis.right(), cy)
+            return
 
         # seconds of source audio covered by one screen pixel
         src_per_px = max(c.speed / max(0.01, self._pps), 1.0 / rate)
@@ -812,7 +851,7 @@ class TimelineWidget(QWidget):
                 if b <= a:
                     continue
                 pk = max(peaks[a:b])
-            y = pk * half_h
+            y = min(half_h, pk * half_h * min(2.0, vol))
             top_pts.append(QPointF(x + 0.5, cy - y))
             bot_pts.append(QPointF(x + 0.5, cy + y))
 
@@ -833,6 +872,7 @@ class TimelineWidget(QWidget):
         self, p: QPainter, peaks: list[float], rate: int,
         chunk: QRect, chunk_vis: QRect, chunk_seconds: float,
         color: QColor, *, src_start: float = 0.0,
+        volume: float = 1.0, muted: bool = False,
     ) -> None:
         """Draw one loop iteration of the added audio. The chunk's left edge
         maps to source second `src_start`; its right edge to
@@ -842,6 +882,13 @@ class TimelineWidget(QWidget):
             return
         cy = chunk.center().y()
         half_h = max(1, chunk.height() // 2 - 2)
+
+        vol = 0.0 if muted else volume
+        if vol <= 0.001:
+            p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 50), 1))
+            p.drawLine(chunk_vis.left(), cy, chunk_vis.right(), cy)
+            return
+
         pps = max(0.01, self._pps)
         src_per_px = 1.0 / pps
         samples_per_px = src_per_px * rate
@@ -863,7 +910,7 @@ class TimelineWidget(QWidget):
                 if i0 >= n - 1:
                     pk = peaks[n - 1]
                 else:
-                    f = raw_idx - i0
+                    f = audio_t * rate - i0
                     pk = peaks[i0] * (1.0 - f) + peaks[i0 + 1] * f
             else:
                 idx = int(audio_t * rate)
@@ -872,7 +919,7 @@ class TimelineWidget(QWidget):
                 if b <= a:
                     continue
                 pk = max(peaks[a:b])
-            y = pk * half_h
+            y = min(half_h, pk * half_h * min(2.0, vol))
             top_pts.append(QPointF(x + 0.5, cy - y))
             bot_pts.append(QPointF(x + 0.5, cy + y))
         if not top_pts:
@@ -1567,18 +1614,52 @@ class TimelineWidget(QWidget):
         move_playhead_action = None
         ripple_del_action = None
         close_gap_action = None
+        clip_vol_actions: dict[object, float] = {}
+        clip_mute_action = None
+        clip_custom_vol_action = None
         if clicked_clip is not None:
             menu.addSeparator()
             move_start_action = menu.addAction("Move Clip to Start")
             move_playhead_action = menu.addAction("Move Clip to Playhead")
             close_gap_action = menu.addAction("Close Gap Left")
             ripple_del_action = menu.addAction("Ripple Delete (close gap)")
+            if clicked_clip.asset.has_audio and not clicked_clip.audio_removed:
+                vol_menu = menu.addMenu(
+                    f"Volume ({'Muted' if clicked_clip.muted else f'{int(round(clicked_clip.audio_volume * 100))}%'})"
+                )
+                clip_mute_action = vol_menu.addAction("Mute Audio" if not clicked_clip.muted else "Unmute Audio")
+                clip_mute_action.setCheckable(True)
+                clip_mute_action.setChecked(clicked_clip.muted)
+                vol_menu.addSeparator()
+                for v_pct in (25, 50, 75, 100, 125, 150, 200):
+                    act = vol_menu.addAction(f"{v_pct}%" + (" (Normal)" if v_pct == 100 else ""))
+                    clip_vol_actions[act] = v_pct / 100.0
+                vol_menu.addSeparator()
+                clip_custom_vol_action = vol_menu.addAction("Custom Volume…")
         replace_action = None
         remove_this_action = None
         remove_all_action = None
         add_lane_action = None
         remove_lane_action = None
+        audio_vol_actions: dict[object, float] = {}
+        audio_mute_action = None
+        audio_custom_vol_action = None
         if clicked_audio is not None:
+            menu.addSeparator()
+            cur_vol = getattr(clicked_audio, "volume", 1.0)
+            is_m = getattr(clicked_audio, "muted", False)
+            vol_menu = menu.addMenu(
+                f"Volume ({'Muted' if is_m else f'{int(round(cur_vol * 100))}%'})"
+            )
+            audio_mute_action = vol_menu.addAction("Mute Audio" if not is_m else "Unmute Audio")
+            audio_mute_action.setCheckable(True)
+            audio_mute_action.setChecked(is_m)
+            vol_menu.addSeparator()
+            for v_pct in (25, 50, 75, 100, 125, 150, 200):
+                act = vol_menu.addAction(f"{v_pct}%" + (" (Normal)" if v_pct == 100 else ""))
+                audio_vol_actions[act] = v_pct / 100.0
+            vol_menu.addSeparator()
+            audio_custom_vol_action = vol_menu.addAction("Custom Volume…")
             menu.addSeparator()
             replace_action = menu.addAction("Replace original audio")
             replace_action.setCheckable(True)
@@ -1617,6 +1698,46 @@ class TimelineWidget(QWidget):
             return
         if ripple_del_action is not None and chosen is ripple_del_action:
             self.clipRippleDeleteRequested.emit(clicked_clip.id)
+            return
+        if clip_mute_action is not None and chosen is clip_mute_action:
+            clicked_clip.muted = not clicked_clip.muted
+            self.clipAudioVolumeChanged.emit(clicked_clip.id, clicked_clip.audio_volume)
+            self.update()
+            return
+        if chosen in clip_vol_actions:
+            clicked_clip.audio_volume = clip_vol_actions[chosen]
+            clicked_clip.muted = False
+            self.clipAudioVolumeChanged.emit(clicked_clip.id, clicked_clip.audio_volume)
+            self.update()
+            return
+        if clip_custom_vol_action is not None and chosen is clip_custom_vol_action:
+            cur = int(round(clicked_clip.audio_volume * 100))
+            val, ok = QInputDialog.getInt(self, "Clip Volume", "Volume % (0 - 200):", cur, 0, 200, 5)
+            if ok:
+                clicked_clip.audio_volume = val / 100.0
+                clicked_clip.muted = (val == 0)
+                self.clipAudioVolumeChanged.emit(clicked_clip.id, clicked_clip.audio_volume)
+                self.update()
+            return
+        if audio_mute_action is not None and chosen is audio_mute_action:
+            clicked_audio.muted = not getattr(clicked_audio, "muted", False)
+            self.addedAudioVolumeChanged.emit(clicked_audio.id, getattr(clicked_audio, "volume", 1.0))
+            self.update()
+            return
+        if chosen in audio_vol_actions:
+            clicked_audio.volume = audio_vol_actions[chosen]
+            clicked_audio.muted = False
+            self.addedAudioVolumeChanged.emit(clicked_audio.id, clicked_audio.volume)
+            self.update()
+            return
+        if audio_custom_vol_action is not None and chosen is audio_custom_vol_action:
+            cur = int(round(getattr(clicked_audio, "volume", 1.0) * 100))
+            val, ok = QInputDialog.getInt(self, "Audio Track Volume", "Volume % (0 - 200):", cur, 0, 200, 5)
+            if ok:
+                clicked_audio.volume = val / 100.0
+                clicked_audio.muted = (val == 0)
+                self.addedAudioVolumeChanged.emit(clicked_audio.id, clicked_audio.volume)
+                self.update()
             return
         if add_lane_action is not None and chosen is add_lane_action:
             self.add_audio_lane()

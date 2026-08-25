@@ -27,6 +27,8 @@ class AddedAudio:
     lane: int = 1
     src_start: float = 0.0
     src_end: float = 0.0
+    volume: float = 1.0
+    muted: bool = False
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def __post_init__(self) -> None:
