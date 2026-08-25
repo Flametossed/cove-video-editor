@@ -887,6 +887,30 @@ class MainWindow(QMainWindow):
         self.crop_reset_btn = QPushButton("Reset crop")
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
+
+        # Volume controls
+        vol_divider = QFrame()
+        vol_divider.setFixedWidth(1)
+        vol_divider.setFixedHeight(22)
+        vol_divider.setStyleSheet(f"background:{theme.BORDER};")
+
+        self.vol_mute_btn = QPushButton("🔊")
+        self.vol_mute_btn.setToolTip("Mute / Unmute selected audio")
+        self.vol_mute_btn.setFixedWidth(32)
+        self.vol_mute_btn.clicked.connect(self._on_vol_mute_clicked)
+
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 200)
+        self.vol_slider.setValue(100)
+        self.vol_slider.setFixedWidth(85)
+        self.vol_slider.setToolTip("Volume for selected clip/audio track (0% - 200%)")
+        self.vol_slider.valueChanged.connect(self._on_vol_slider_changed)
+
+        self.vol_label = QLabel("100%")
+        self.vol_label.setFixedWidth(38)
+        self.vol_label.setAlignment(Qt.AlignCenter)
+        self.vol_label.setStyleSheet(f"color:{theme.TEXT_2}; font-size:11px;")
+
         self.range_label = QLabel("—")
         self.range_label.setObjectName("RangeLabel")
 
@@ -897,6 +921,11 @@ class MainWindow(QMainWindow):
         transport.addSpacing(4)
         transport.addWidget(self.crop_btn)
         transport.addWidget(self.crop_reset_btn)
+        transport.addSpacing(4)
+        transport.addWidget(vol_divider)
+        transport.addWidget(self.vol_mute_btn)
+        transport.addWidget(self.vol_slider)
+        transport.addWidget(self.vol_label)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
         preview_lay.addWidget(transport_bar)
@@ -932,6 +961,8 @@ class MainWindow(QMainWindow):
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
         self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
         self.timeline.scrollValueChanged.connect(self._on_timeline_scroll_value)
+        self.timeline.clipAudioVolumeChanged.connect(self._on_timeline_clip_volume_changed)
+        self.timeline.addedAudioVolumeChanged.connect(self._on_timeline_added_audio_volume_changed)
         timeline_lay.addWidget(self.timeline, stretch=1)
 
         # Scrollbar + VideoPad-style zoom bar share one row. Scrollbar
@@ -1734,9 +1765,89 @@ class MainWindow(QMainWindow):
         sid = self.timeline.selected_id()
         return next((c for c in self._clips if c.id == sid), None)
 
+    def _selected_audio_item(self) -> AddedAudio | None:
+        aid = getattr(self.timeline, "_added_audio_selected_id", "")
+        if aid:
+            return next((a for a in self._added_audios if a.id == aid), None)
+        return None
+
+    def _sync_volume_ui(self) -> None:
+        added_a = self._selected_audio_item()
+        if added_a is not None:
+            self.vol_slider.setEnabled(True)
+            self.vol_mute_btn.setEnabled(True)
+            self.vol_slider.blockSignals(True)
+            is_m = getattr(added_a, "muted", False)
+            self.vol_slider.setValue(0 if is_m else int(round(getattr(added_a, "volume", 1.0) * 100)))
+            self.vol_slider.blockSignals(False)
+            self.vol_label.setText("Muted" if is_m else f"{int(round(getattr(added_a, 'volume', 1.0) * 100))}%")
+            self.vol_mute_btn.setText("🔇" if is_m else "🔊")
+            return
+
+        c = self._selected_clip()
+        if c is not None and c.asset.has_audio and not c.audio_removed:
+            self.vol_slider.setEnabled(True)
+            self.vol_mute_btn.setEnabled(True)
+            self.vol_slider.blockSignals(True)
+            self.vol_slider.setValue(0 if c.muted else int(round(c.audio_volume * 100)))
+            self.vol_slider.blockSignals(False)
+            self.vol_label.setText("Muted" if c.muted else f"{int(round(c.audio_volume * 100))}%")
+            self.vol_mute_btn.setText("🔇" if c.muted else "🔊")
+        else:
+            self.vol_slider.setEnabled(False)
+            self.vol_mute_btn.setEnabled(False)
+            self.vol_slider.blockSignals(True)
+            self.vol_slider.setValue(100)
+            self.vol_slider.blockSignals(False)
+            self.vol_label.setText("—")
+            self.vol_mute_btn.setText("🔊")
+
+    def _on_vol_slider_changed(self, val: int) -> None:
+        added_a = self._selected_audio_item()
+        if added_a is not None:
+            added_a.volume = val / 100.0
+            added_a.muted = (val == 0)
+            self.vol_label.setText("Muted" if added_a.muted else f"{val}%")
+            self.vol_mute_btn.setText("🔇" if added_a.muted else "🔊")
+            self._update_audio_volumes()
+            self.timeline.update()
+            return
+
+        c = self._selected_clip()
+        if c is not None and c.asset.has_audio and not c.audio_removed:
+            c.audio_volume = val / 100.0
+            c.muted = (val == 0)
+            self.vol_label.setText("Muted" if c.muted else f"{val}%")
+            self.vol_mute_btn.setText("🔇" if c.muted else "🔊")
+            self._update_audio_volumes()
+            self.timeline.update()
+
+    def _on_vol_mute_clicked(self) -> None:
+        added_a = self._selected_audio_item()
+        if added_a is not None:
+            added_a.muted = not getattr(added_a, "muted", False)
+            self._sync_volume_ui()
+            self._update_audio_volumes()
+            self.timeline.update()
+            return
+
+        c = self._selected_clip()
+        if c is not None and c.asset.has_audio and not c.audio_removed:
+            c.muted = not c.muted
+            self._sync_volume_ui()
+            self._update_audio_volumes()
+            self.timeline.update()
+
+    def _on_timeline_clip_volume_changed(self, clip_id: str, vol: float) -> None:
+        self._sync_volume_ui()
+        self._update_audio_volumes()
+
+    def _on_timeline_added_audio_volume_changed(self, audio_id: str, vol: float) -> None:
+        self._sync_volume_ui()
+        self._update_audio_volumes()
+
     def _sync_selected_clip_ui(self) -> None:
-        # The settings panel is gone; the transport just shows sequence info.
-        pass
+        self._sync_volume_ui()
 
     def _on_clip_selected(self, clip_id: str) -> None:
         c = next((c for c in self._clips if c.id == clip_id), None)
@@ -2285,8 +2396,14 @@ class MainWindow(QMainWindow):
         else:
             self.audio.setVolume(orig_vol)
             self.clip_audio_output.setVolume(0.0)
-        for out in self._added_outputs.values():
-            out.setVolume(added_gain)
+        for aid, out in self._added_outputs.items():
+            audio_obj = next((a for a in self._added_audios if a.id == aid), None)
+            if audio_obj and getattr(audio_obj, "muted", False):
+                out.setVolume(0.0)
+            elif audio_obj:
+                out.setVolume(max(0.0, min(1.0, 0.7 * getattr(audio_obj, "volume", 1.0) * added_gain)))
+            else:
+                out.setVolume(added_gain)
 
     _SYNC_DRIFT_MS = 200
 
@@ -2834,11 +2951,13 @@ class MainWindow(QMainWindow):
         vol = self.audio_gain.value()
         orig_vol = self.orig_gain.value()
         for audio in self._added_audios:
+            is_m = getattr(audio, "muted", False)
+            track_vol = 0.0 if is_m else (getattr(audio, "volume", 1.0) * vol)
             audio_tracks.append(
                 AudioTrack(
                     path=audio.path,
                     replace=replace,
-                    volume=vol,
+                    volume=track_vol,
                     original_volume=orig_vol,
                     offset=audio.offset,
                     duration=audio.src_span,
