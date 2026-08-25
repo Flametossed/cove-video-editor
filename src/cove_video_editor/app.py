@@ -105,7 +105,7 @@ from .clip import (
 from .clip_bin import ASSET_MIME, ClipBin
 from .crop_overlay import CROP_ASPECT_PRESETS, CropOverlay
 from .downloader import DownloadVideoDialog
-from .exporter import AudioTrack, ExportJob, start_export
+from .exporter import RESOLUTION_PRESETS, AudioTrack, ExportJob, start_export
 from .thumbnails import start_thumbnails, start_waveform
 from .timeline_widget import TimelineMinimap, TimelineWidget
 
@@ -1381,9 +1381,26 @@ class MainWindow(QMainWindow):
         export_lbl.setObjectName("ExportLabel")
         as_lbl = QLabel("AS")
         as_lbl.setObjectName("ExportLabel")
+        at_lbl = QLabel("AT")
+        at_lbl.setObjectName("ExportLabel")
+        self.export_at_lbl = at_lbl
         using_lbl = QLabel("USING")
         using_lbl.setObjectName("ExportLabel")
         self.export_using_lbl = using_lbl
+
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.setMinimumWidth(120)
+        self.resolution_combo.addItems(list(RESOLUTION_PRESETS.keys()))
+        self.resolution_combo.setCurrentText("Source")
+        self.resolution_combo.setToolTip(
+            "Export resolution. Presets scale the video to that long edge "
+            "while preserving the current aspect ratio (portrait stays portrait)."
+        )
+        s = QSettings("Cove", "Cove Video Editor")
+        saved_res = s.value("export/resolution", None)
+        if saved_res and saved_res in RESOLUTION_PRESETS:
+            self.resolution_combo.setCurrentText(str(saved_res))
+        self.resolution_combo.currentTextChanged.connect(self._on_resolution_combo_changed)
 
         self.encoder_combo = QComboBox()
         self.encoder_combo.setMinimumWidth(180)
@@ -1404,6 +1421,8 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.export_type_combo, stretch=0)
         bottom.addWidget(as_lbl)
         bottom.addWidget(self.format_combo, stretch=0)
+        bottom.addWidget(at_lbl)
+        bottom.addWidget(self.resolution_combo, stretch=0)
         bottom.addWidget(using_lbl)
         bottom.addWidget(self.encoder_combo, stretch=0)
 
@@ -3844,6 +3863,7 @@ class MainWindow(QMainWindow):
             region_end=region_end,
             subtitles=active_sub,
             encoder_pref=encoder_pref,
+            resolution=self.resolution_combo.currentText(),
         )
 
         self._last_progress = 0
@@ -3952,6 +3972,8 @@ class MainWindow(QMainWindow):
         is_audio = self._is_audio_only_export()
         self.encoder_combo.setEnabled(can_export and not is_audio)
         self.export_using_lbl.setEnabled(can_export and not is_audio)
+        self.resolution_combo.setEnabled(can_export and not is_audio)
+        self.export_at_lbl.setEnabled(can_export and not is_audio)
         self.export_btn.setEnabled(can_export)
         for w in (self.split_btn, self.delete_clip_btn):
             w.setEnabled(has_any)
@@ -4092,6 +4114,10 @@ class MainWindow(QMainWindow):
     def _on_encoder_combo_changed(self, text: str) -> None:
         s = QSettings("Cove", "Cove Video Editor")
         s.setValue("export/encoder", text)
+
+    def _on_resolution_combo_changed(self, text: str) -> None:
+        s = QSettings("Cove", "Cove Video Editor")
+        s.setValue("export/resolution", text)
 
     # --- auto updater ---------------------------------------------------
 

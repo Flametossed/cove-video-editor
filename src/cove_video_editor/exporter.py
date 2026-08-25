@@ -25,6 +25,21 @@ else:
 
 _FILTER_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Export resolution presets. Each maps a display label to a target LONG EDGE
+# in pixels. "Source" means "no scaling" (use the resolved canvas size). When
+# a numeric preset is chosen, the canvas is scaled so its longer dimension
+# equals the target while preserving the current aspect ratio — so a portrait
+# 9:16 crop stays portrait at 1080p.
+RESOLUTION_PRESETS: dict[str, int | None] = {
+    "Source": None,
+    "4K (2160p)": 2160,
+    "1440p": 1440,
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+    "360p": 360,
+}
+
 
 @dataclass
 class AudioTrack:
@@ -64,6 +79,10 @@ class ExportJob:
     canvas_fit: str = "fill"
     # Target canvas aspect ratio (e.g. 9/16, 16/9, 1.0)
     canvas_aspect: float | None = None
+    # Export resolution preset label (see RESOLUTION_PRESETS). "Source" (or
+    # None) leaves the resolved canvas size unchanged; a numeric preset scales
+    # the canvas to that long edge while preserving the aspect ratio.
+    resolution: str | None = None
 
     @property
     def total_timeline(self) -> float:
@@ -184,6 +203,14 @@ class ExportWorker(QObject):
             tgt_w, tgt_h = first_real.asset.width, first_real.asset.height
         else:
             tgt_w, tgt_h = 1280, 720
+        # Resolution preset: scale the resolved canvas to the target long edge
+        # while preserving the aspect ratio. "Source" (None) leaves it as-is.
+        long_edge = RESOLUTION_PRESETS.get(job.resolution or "Source")
+        if long_edge and long_edge > 0:
+            scale = long_edge / max(1, max(tgt_w, tgt_h))
+            tgt_w = max(2, int(round(tgt_w * scale)) - (int(round(tgt_w * scale)) % 2))
+            tgt_h = max(2, int(round(tgt_h * scale)) - (int(round(tgt_h * scale)) % 2))
+
         tgt_w = max(2, tgt_w - (tgt_w % 2))
         tgt_h = max(2, tgt_h - (tgt_h % 2))
 

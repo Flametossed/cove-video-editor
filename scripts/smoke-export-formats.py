@@ -28,7 +28,12 @@ _qapp = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
 
 from cove_video_editor import ffmpeg_utils as ff
 from cove_video_editor.clip import Clip, MediaAsset
-from cove_video_editor.exporter import AudioTrack, ExportJob, ExportWorker
+from cove_video_editor.exporter import (
+    RESOLUTION_PRESETS,
+    AudioTrack,
+    ExportJob,
+    ExportWorker,
+)
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -332,6 +337,21 @@ def build_matrix(fixtures: dict[str, Path], out_dir: Path) -> list[tuple[str, Ex
                     audio_tracks=[extra_track],
                 ),
             ))
+
+            # Resolution presets: exercise a downscale and an upscale on the
+            # video+audio clip. The fixture is 640x360, so 1080p upscales and
+            # 360p downscales to the long edge.
+            for res_label in ("1080p", "360p"):
+                res_clip = _make_clip(video_av_asset, dur=3.0)
+                cases.append((
+                    f"{fmt_key} | resolution {res_label}",
+                    ExportJob(
+                        clips=[res_clip],
+                        output=out_dir / f"res_{res_label}.{ext}",
+                        fmt_key=fmt_key,
+                        resolution=res_label,
+                    ),
+                ))
 
     return cases
 
