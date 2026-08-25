@@ -36,15 +36,29 @@ class CropOverlay(QWidget):
         self._video_aspect: float = 16 / 9
         self._aspect_lock: float | None = None
         self._preset_name: str = "Free (Custom)"
+        self._fit_mode: str = "fill"  # "fill" (crop to fill), "fit" (letterbox / keep proportions), "stretch"
         self._rect_norm: QRectF = QRectF(0.0, 0.0, 1.0, 1.0)
         self._drag_target: str | None = None
         self._drag_start_widget: QPointF | None = None
         self._drag_start_rect: QRectF | None = None
 
+    def set_fit_mode(self, mode: str) -> None:
+        """Set canvas fit mode: 'fill' (crop to fill), 'fit' (letterbox / keep all), 'stretch'."""
+        self._fit_mode = mode if mode in ("fill", "fit", "stretch") else "fill"
+        if self._fit_mode in ("fit", "stretch"):
+            self._rect_norm = QRectF(0.0, 0.0, 1.0, 1.0)
+        elif self._aspect_lock is not None:
+            self.fit_to_canvas()
+        self.update()
+        self.cropChanged.emit(self.normalized_rect())
+
+    def fit_mode(self) -> str:
+        return self._fit_mode
+
     def set_video_aspect(self, aspect: float) -> None:
         if aspect > 0:
             self._video_aspect = aspect
-            if self._aspect_lock is not None:
+            if self._aspect_lock is not None and self._fit_mode == "fill":
                 self.set_aspect_ratio_preset(self._aspect_lock, self._preset_name)
             self.update()
 
@@ -165,42 +179,55 @@ class CropOverlay(QWidget):
         v = self._video_display_rect()
         c = self._crop_rect_widget()
 
-        dim = QColor(0, 0, 0, 150)
-        if c.top() > v.top():
-            p.fillRect(QRectF(v.left(), v.top(), v.width(), c.top() - v.top()), dim)
-        if c.bottom() < v.bottom():
-            p.fillRect(QRectF(v.left(), c.bottom(), v.width(), v.bottom() - c.bottom()), dim)
-        p.fillRect(QRectF(v.left(), c.top(), c.left() - v.left(), c.height()), dim)
-        p.fillRect(QRectF(c.right(), c.top(), v.right() - c.right(), c.height()), dim)
+        if self._fit_mode == "fill":
+            dim = QColor(0, 0, 0, 150)
+            if c.top() > v.top():
+                p.fillRect(QRectF(v.left(), v.top(), v.width(), c.top() - v.top()), dim)
+            if c.bottom() < v.bottom():
+                p.fillRect(QRectF(v.left(), c.bottom(), v.width(), v.bottom() - c.bottom()), dim)
+            p.fillRect(QRectF(v.left(), c.top(), c.left() - v.left(), c.height()), dim)
+            p.fillRect(QRectF(c.right(), c.top(), v.right() - c.right(), c.height()), dim)
 
-        thirds_pen = QPen(QColor(255, 255, 255, 80), 1, Qt.DashLine)
-        p.setPen(thirds_pen)
-        for i in (1, 2):
-            x = c.left() + c.width() * i / 3
-            p.drawLine(QPointF(x, c.top()), QPointF(x, c.bottom()))
-            y = c.top() + c.height() * i / 3
-            p.drawLine(QPointF(c.left(), y), QPointF(c.right(), y))
+            thirds_pen = QPen(QColor(255, 255, 255, 80), 1, Qt.DashLine)
+            p.setPen(thirds_pen)
+            for i in (1, 2):
+                x = c.left() + c.width() * i / 3
+                p.drawLine(QPointF(x, c.top()), QPointF(x, c.bottom()))
+                y = c.top() + c.height() * i / 3
+                p.drawLine(QPointF(c.left(), y), QPointF(c.right(), y))
 
-        border_pen = QPen(QColor("#5eead4"))
-        border_pen.setWidth(2)
-        p.setPen(border_pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawRect(c)
+            border_pen = QPen(QColor("#5eead4"))
+            border_pen.setWidth(2)
+            p.setPen(border_pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(c)
 
-        p.setBrush(QColor("#5eead4"))
-        p.setPen(QPen(QColor("#0d1216"), 1))
-        s = HANDLE_SIZE
-        for pt in self._handle_centers(c).values():
-            p.drawRect(QRectF(pt.x() - s / 2, pt.y() - s / 2, s, s))
+            p.setBrush(QColor("#5eead4"))
+            p.setPen(QPen(QColor("#0d1216"), 1))
+            s = HANDLE_SIZE
+            for pt in self._handle_centers(c).values():
+                p.drawRect(QRectF(pt.x() - s / 2, pt.y() - s / 2, s, s))
+        else:
+            # Fit (letterbox) or Stretch mode
+            border_pen = QPen(QColor("#5eead4"), 2, Qt.DashLine if self._fit_mode == "fit" else Qt.SolidLine)
+            p.setPen(border_pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(v)
 
-        # Render aspect ratio tag pill on top-left of crop box if locked
+        # Render aspect ratio tag pill on top-left of crop box
         if self._preset_name and self._preset_name != "Free (Custom)":
             short_tag = self._preset_name.split(" ")[0]
+            if self._fit_mode == "fit":
+                short_tag += " (Fit)"
+            elif self._fit_mode == "stretch":
+                short_tag += " (Stretch)"
             from PySide6.QtGui import QFont
             p.setFont(QFont("Inter", 9, QFont.Bold))
             fm = p.fontMetrics()
             tw = fm.horizontalAdvance(short_tag)
-            badge_rect = QRectF(c.left() + 8, c.top() + 8, tw + 14, 20)
+            badge_x = c.left() + 8 if self._fit_mode == "fill" else v.left() + 8
+            badge_y = c.top() + 8 if self._fit_mode == "fill" else v.top() + 8
+            badge_rect = QRectF(badge_x, badge_y, tw + 14, 20)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(11, 16, 19, 210))
             p.drawRoundedRect(badge_rect, 4, 4)
@@ -210,6 +237,8 @@ class CropOverlay(QWidget):
         p.end()
 
     def _hit_test(self, pos: QPointF) -> str | None:
+        if self._fit_mode != "fill":
+            return None
         c = self._crop_rect_widget()
         for name, center in self._handle_centers(c).items():
             if (abs(pos.x() - center.x()) <= HIT_PAD

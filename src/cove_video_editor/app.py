@@ -119,6 +119,13 @@ VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpg", ".mpeg", 
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 SUB_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
+
+CROP_FIT_MODES: dict[str, str] = {
+    "Fit (Resize to fit canvas)": "fit",
+    "Fill (Crop to fill canvas)": "fill",
+    "Stretch to fill canvas": "stretch",
+}
+
 # Rounded-corner radius for the frameless window. Windows 11 rounds natively
 # via the DWM; other platforms fall back to a rounded widget mask.
 WINDOW_CORNER_RADIUS = 10
@@ -453,10 +460,64 @@ class VideoView(QGraphicsView):
         self.sub_outline.setVisible(False)
         self.sub_fill.setVisible(False)
 
-    def set_native_size(self, width: int, height: int) -> None:
-        self.video_item.setSize(QSizeF(width, height))
-        self._scene.setSceneRect(QRectF(0, 0, width, height))
+    def update_canvas(
+        self,
+        native_w: int,
+        native_h: int,
+        target_aspect: float | None = None,
+        fit_mode: str = "fill",
+    ) -> None:
+        self._native_w = native_w
+        self._native_h = native_h
+        self._target_aspect = target_aspect
+        self._fit_mode = fit_mode
+
+        if native_w <= 0 or native_h <= 0:
+            return
+
+        base_ar = native_w / max(1, native_h)
+        if target_aspect is not None and target_aspect > 0 and fit_mode in ("fit", "stretch"):
+            if target_aspect < base_ar:
+                canvas_h = native_h
+                canvas_w = int(round(native_h * target_aspect))
+            else:
+                canvas_w = native_w
+                canvas_h = int(round(native_w / target_aspect))
+            canvas_w = max(2, canvas_w - (canvas_w % 2))
+            canvas_h = max(2, canvas_h - (canvas_h % 2))
+
+            self._scene.setSceneRect(QRectF(0, 0, canvas_w, canvas_h))
+
+            if fit_mode == "stretch":
+                self.video_item.setAspectRatioMode(Qt.IgnoreAspectRatio)
+                self.video_item.setSize(QSizeF(canvas_w, canvas_h))
+                self.video_item.setPos(0, 0)
+                self.pixmap_item.setPos(0, 0)
+            else:  # fit (resize to fit canvas / retain proportions)
+                self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
+                scale_factor = min(canvas_w / native_w, canvas_h / native_h)
+                item_w = native_w * scale_factor
+                item_h = native_h * scale_factor
+                item_x = (canvas_w - item_w) / 2.0
+                item_y = (canvas_h - item_h) / 2.0
+                self.video_item.setSize(QSizeF(item_w, item_h))
+                self.video_item.setPos(item_x, item_y)
+                self.pixmap_item.setPos(item_x, item_y)
+        else:
+            self._scene.setSceneRect(QRectF(0, 0, native_w, native_h))
+            self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
+            self.video_item.setSize(QSizeF(native_w, native_h))
+            self.video_item.setPos(0, 0)
+            self.pixmap_item.setPos(0, 0)
+
         self._fit()
+
+    def set_native_size(self, width: int, height: int) -> None:
+        self.update_canvas(
+            width, height,
+            getattr(self, "_target_aspect", None),
+            getattr(self, "_fit_mode", "fill"),
+        )
 
     def _fit(self) -> None:
         if not self._scene.sceneRect().isEmpty():
@@ -984,10 +1045,14 @@ class MainWindow(QMainWindow):
         self.crop_aspect_combo.setCurrentText("Free (Custom)")
         self.crop_aspect_combo.setVisible(False)
         self.crop_aspect_combo.currentTextChanged.connect(self._on_crop_aspect_changed)
-        self.crop_fit_btn = QPushButton("Fit to canvas")
-        self.crop_fit_btn.setToolTip("Fit and center crop box to the full canvas bounds")
-        self.crop_fit_btn.setVisible(False)
-        self.crop_fit_btn.clicked.connect(self._on_crop_fit_clicked)
+        self.crop_fit_combo = QComboBox()
+        self.crop_fit_combo.setToolTip(
+            "Canvas fit mode: Fill (crop to fill), Fit (keep all with black bars), or Stretch"
+        )
+        self.crop_fit_combo.addItems(list(CROP_FIT_MODES.keys()))
+        self.crop_fit_combo.setCurrentText("Fill (Crop to fill)")
+        self.crop_fit_combo.setVisible(False)
+        self.crop_fit_combo.currentTextChanged.connect(self._on_crop_fit_mode_changed)
         self.crop_reset_btn = QPushButton("Reset crop")
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
@@ -1001,7 +1066,7 @@ class MainWindow(QMainWindow):
         transport.addSpacing(4)
         transport.addWidget(self.crop_btn)
         transport.addWidget(self.crop_aspect_combo)
-        transport.addWidget(self.crop_fit_btn)
+        transport.addWidget(self.crop_fit_combo)
         transport.addWidget(self.crop_reset_btn)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
@@ -1779,6 +1844,7 @@ class MainWindow(QMainWindow):
         self._preview_clip_id = clip.id
         self.video_view.set_native_size(clip.asset.width, clip.asset.height)
         self.crop_overlay.set_video_aspect(clip.asset.width / max(1, clip.asset.height))
+        self._sync_preview_canvas()
         if clip.asset.kind == "image":
             # Image clips don't drive the media player — they're a static
             # pixmap overlay. Drop the player sources so no background
@@ -2842,7 +2908,38 @@ class MainWindow(QMainWindow):
         self.timecode_edit.setText(_format_timecode(self.timeline.playhead()))
         self.timecode_edit.clearFocus()
 
+    def _selected_clip(self) -> Clip | None:
+        cid = getattr(self.timeline, "_selected_id", "")
+        if cid:
+            for c in self._clips:
+                if c.id == cid:
+                    return c
+        if self._preview_clip_id:
+            for c in self._clips:
+                if c.id == self._preview_clip_id:
+                    return c
+        return self._clips[0] if self._clips else None
+
+    def _current_preview_clip(self) -> Clip | None:
+        return self._selected_clip()
+
     # --- crop ---------------------------------------------------------
+
+    def _sync_preview_canvas(self) -> None:
+        c = self._current_preview_clip()
+        if c is None or c.asset.width <= 0 or c.asset.height <= 0:
+            return
+        if self.crop_btn.isChecked():
+            preset_key = self.crop_aspect_combo.currentText()
+            aspect = CROP_ASPECT_PRESETS.get(preset_key)
+            fit_label = self.crop_fit_combo.currentText()
+            fit_mode = CROP_FIT_MODES.get(fit_label, "fill")
+        else:
+            aspect = None
+            fit_mode = "fill"
+
+        self.video_view.update_canvas(c.asset.width, c.asset.height, aspect, fit_mode)
+        self.crop_overlay.setVisible(self.crop_btn.isChecked() and fit_mode == "fill")
 
     def _on_crop_toggled(self, checked: bool) -> None:
         c = self._selected_clip()
@@ -2858,11 +2955,12 @@ class MainWindow(QMainWindow):
                     self.crop_overlay.set_aspect_ratio_preset(ratio, preset_key)
                 else:
                     self.crop_overlay.set_normalized_rect(QRectF(0.1, 0.1, 0.8, 0.8))
-        self.crop_overlay.setVisible(checked)
-        self.crop_overlay.raise_()
         self.crop_aspect_combo.setVisible(checked)
-        self.crop_fit_btn.setVisible(checked)
+        self.crop_fit_combo.setVisible(checked)
         self.crop_reset_btn.setVisible(checked)
+        self._sync_preview_canvas()
+        if checked and self.crop_overlay.isVisible():
+            self.crop_overlay.raise_()
 
     def _on_crop_aspect_changed(self, preset_name: str) -> None:
         c = self._selected_clip()
@@ -2870,18 +2968,22 @@ class MainWindow(QMainWindow):
             self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
         ratio = CROP_ASPECT_PRESETS.get(preset_name)
         self.crop_overlay.set_aspect_ratio_preset(ratio, preset_name)
+        self._sync_preview_canvas()
 
-    def _on_crop_fit_clicked(self) -> None:
-        c = self._selected_clip()
-        if c:
-            self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
-        self.crop_overlay.fit_to_canvas()
+    def _on_crop_fit_mode_changed(self, mode_label: str) -> None:
+        mode_key = CROP_FIT_MODES.get(mode_label, "fill")
+        self.crop_overlay.set_fit_mode(mode_key)
+        self._sync_preview_canvas()
 
     def _on_crop_reset(self) -> None:
         self.crop_aspect_combo.blockSignals(True)
         self.crop_aspect_combo.setCurrentText("Free (Custom)")
         self.crop_aspect_combo.blockSignals(False)
+        self.crop_fit_combo.blockSignals(True)
+        self.crop_fit_combo.setCurrentText("Fill (Crop to fill canvas)")
+        self.crop_fit_combo.blockSignals(False)
         self.crop_overlay.reset()
+        self._sync_preview_canvas()
 
     # --- preview context menu ----------------------------------------
 
@@ -2921,6 +3023,9 @@ class MainWindow(QMainWindow):
     def _crop_pixels(self) -> tuple[int, int, int, int] | None:
         c = self._selected_clip()
         if not self.crop_btn.isChecked() or c is None:
+            return None
+        fit_mode = CROP_FIT_MODES.get(self.crop_fit_combo.currentText(), "fill")
+        if fit_mode != "fill":
             return None
         r = self.crop_overlay.normalized_rect()
         if r == QRectF(0, 0, 1, 1):
@@ -3249,11 +3354,22 @@ class MainWindow(QMainWindow):
         active_sub = next((s.clone() for s in self._subs if s.active), None)
         encoder_pref = ff.ENCODER_KEY_MAP.get(self.encoder_combo.currentText(), "auto")
 
+        crop_pixels = self._crop_pixels()
+        canvas_fit = "fill"
+        canvas_aspect = None
+        if self.crop_btn.isChecked():
+            preset_key = self.crop_aspect_combo.currentText()
+            canvas_aspect = CROP_ASPECT_PRESETS.get(preset_key)
+            fit_label = self.crop_fit_combo.currentText()
+            canvas_fit = CROP_FIT_MODES.get(fit_label, "fill")
+
         job = ExportJob(
             clips=[c.clone() for c in self._clips],
             output=Path(out_path),
             fmt_key=fmt_key,
-            crop=self._crop_pixels(),
+            crop=crop_pixels,
+            canvas_fit=canvas_fit,
+            canvas_aspect=canvas_aspect,
             audio_tracks=audio_tracks,
             region_start=region_start,
             region_end=region_end,
