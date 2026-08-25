@@ -220,6 +220,10 @@ class Clip:
     # the timeline but no waveform is shown and the audio is silent. The
     # chain chip toggles this back to False when the user wants to restore.
     audio_removed: bool = False
+    # Crop properties: crop_rect is normalized (x, y, w, h) in 0..1 range
+    crop_rect: tuple[float, float, float, float] | None = None
+    crop_preset: str = "Free (Custom)"
+    crop_fit_mode: str = "fill"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     thumbs: list[QImage] = field(default_factory=list)
     thumb_pixmaps: list[QPixmap] = field(default_factory=list)
@@ -253,6 +257,9 @@ class Clip:
             muted=self.muted, audio_volume=self.audio_volume,
             linked_audio=self.linked_audio,
             audio_offset=self.audio_offset, audio_removed=self.audio_removed,
+            crop_rect=self.crop_rect,
+            crop_preset=self.crop_preset,
+            crop_fit_mode=self.crop_fit_mode,
         )
         c.thumbs = list(self.thumbs)
         c.thumb_pixmaps = list(self.thumb_pixmaps)

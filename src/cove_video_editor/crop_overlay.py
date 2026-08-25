@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 
@@ -29,6 +29,7 @@ class CropOverlay(QWidget):
     """
 
     cropChanged = Signal(QRectF)
+    confirmRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -250,6 +251,7 @@ class CropOverlay(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
             return
         target = self._hit_test(event.position())
         if target:
@@ -257,6 +259,24 @@ class CropOverlay(QWidget):
             self._drag_start_widget = event.position()
             self._drag_start_rect = QRectF(self._rect_norm)
             event.accept()
+        else:
+            event.ignore()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            c = self._crop_rect_widget()
+            if c.contains(event.position()):
+                self.confirmRequested.emit()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.confirmRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_target:

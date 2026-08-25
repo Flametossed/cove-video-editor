@@ -10,6 +10,7 @@ from PySide6.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QPointF,
     QRectF,
     QSettings,
     QSizeF,
@@ -121,8 +122,8 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 SUB_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
 
 CROP_FIT_MODES: dict[str, str] = {
-    "Fit (Resize to fit canvas)": "fit",
     "Fill (Crop to fill canvas)": "fill",
+    "Fit (Resize to fit canvas)": "fit",
     "Stretch to fill canvas": "stretch",
 }
 
@@ -466,14 +467,34 @@ class VideoView(QGraphicsView):
         native_h: int,
         target_aspect: float | None = None,
         fit_mode: str = "fill",
+        crop_rect: QRectF | tuple[float, float, float, float] | None = None,
     ) -> None:
         self._native_w = native_w
         self._native_h = native_h
         self._target_aspect = target_aspect
         self._fit_mode = fit_mode
+        self._crop_rect = crop_rect
 
         if native_w <= 0 or native_h <= 0:
             return
+
+        if crop_rect is not None and fit_mode == "fill":
+            if isinstance(crop_rect, tuple):
+                cr = QRectF(*crop_rect)
+            else:
+                cr = QRectF(crop_rect)
+            if cr != QRectF(0, 0, 1, 1):
+                cx = cr.x() * native_w
+                cy = cr.y() * native_h
+                cw = cr.width() * native_w
+                ch = cr.height() * native_h
+                self._scene.setSceneRect(QRectF(cx, cy, cw, ch))
+                self.video_item.setAspectRatioMode(Qt.KeepAspectRatio)
+                self.video_item.setSize(QSizeF(native_w, native_h))
+                self.video_item.setPos(0, 0)
+                self.pixmap_item.setPos(0, 0)
+                self._fit()
+                return
 
         base_ar = native_w / max(1, native_h)
         if target_aspect is not None and target_aspect > 0 and fit_mode in ("fit", "stretch"):
@@ -517,6 +538,7 @@ class VideoView(QGraphicsView):
             width, height,
             getattr(self, "_target_aspect", None),
             getattr(self, "_fit_mode", "fill"),
+            getattr(self, "_crop_rect", None),
         )
 
     def _fit(self) -> None:
@@ -533,6 +555,151 @@ class VideoView(QGraphicsView):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def set_crop_indicator(
+        self,
+        active: bool,
+        tag: str = "",
+        dimensions: str = "",
+        crop_norm_rect: QRectF | tuple[float, float, float, float] | None = None,
+    ) -> None:
+        self._crop_indicator_active = active
+        self._crop_indicator_tag = tag
+        self._crop_indicator_dim = dimensions
+        if isinstance(crop_norm_rect, tuple):
+            self._crop_indicator_rect = QRectF(*crop_norm_rect)
+        elif isinstance(crop_norm_rect, QRectF):
+            self._crop_indicator_rect = QRectF(crop_norm_rect)
+        else:
+            self._crop_indicator_rect = None
+        self.viewport().update()
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        super().drawForeground(painter, rect)
+        if not getattr(self, "_crop_indicator_active", False):
+            return
+        if self._scene.sceneRect().isEmpty():
+            return
+
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        nw = getattr(self, "_native_w", 0)
+        nh = getattr(self, "_native_h", 0)
+        if nw <= 0 or nh <= 0:
+            painter.restore()
+            return
+
+        # Full video bounding box in viewport pixels
+        full_tl = self.mapFromScene(QPointF(0, 0))
+        full_br = self.mapFromScene(QPointF(nw, nh))
+        full_rect = QRectF(QPointF(full_tl), QPointF(full_br)).normalized()
+
+        crop_norm = getattr(self, "_crop_indicator_rect", None)
+        if crop_norm is not None and crop_norm != QRectF(0, 0, 1, 1):
+            cx = crop_norm.x() * nw
+            cy = crop_norm.y() * nh
+            cw = crop_norm.width() * nw
+            ch = crop_norm.height() * nh
+            c_tl = self.mapFromScene(QPointF(cx, cy))
+            c_br = self.mapFromScene(QPointF(cx + cw, cy + ch))
+            v_rect = QRectF(QPointF(c_tl), QPointF(c_br)).normalized()
+        else:
+            v_rect = full_rect
+
+        # 1. Darken the parts outside the crop zone
+        dim_color = QColor(0, 0, 0, 175)
+        if v_rect != full_rect:
+            # Top matte
+            if v_rect.top() > full_rect.top():
+                painter.fillRect(
+                    QRectF(full_rect.left(), full_rect.top(), full_rect.width(), v_rect.top() - full_rect.top()),
+                    dim_color,
+                )
+            # Bottom matte
+            if v_rect.bottom() < full_rect.bottom():
+                painter.fillRect(
+                    QRectF(full_rect.left(), v_rect.bottom(), full_rect.width(), full_rect.bottom() - v_rect.bottom()),
+                    dim_color,
+                )
+            # Left matte
+            if v_rect.left() > full_rect.left():
+                painter.fillRect(
+                    QRectF(full_rect.left(), v_rect.top(), v_rect.left() - full_rect.left(), v_rect.height()),
+                    dim_color,
+                )
+            # Right matte
+            if v_rect.right() < full_rect.right():
+                painter.fillRect(
+                    QRectF(v_rect.right(), v_rect.top(), full_rect.right() - v_rect.right(), v_rect.height()),
+                    dim_color,
+                )
+
+        if v_rect.width() > 30 and v_rect.height() > 30:
+            # 2. Subtle crop boundary border
+            border_pen = QPen(QColor(94, 234, 212, 180), 1.5)
+            painter.setPen(border_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(v_rect)
+
+            # 3. Viewfinder corner bracket guides
+            bracket_len = min(20.0, max(8.0, min(v_rect.width(), v_rect.height()) * 0.15))
+            bracket_pen = QPen(QColor("#5eead4"), 2.5)
+            bracket_pen.setCapStyle(Qt.RoundCap)
+            bracket_pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(bracket_pen)
+
+            l, r, t, b = v_rect.left(), v_rect.right(), v_rect.top(), v_rect.bottom()
+
+            # Top-left corner
+            painter.drawLine(QPointF(l, t), QPointF(l + bracket_len, t))
+            painter.drawLine(QPointF(l, t), QPointF(l, t + bracket_len))
+
+            # Top-right corner
+            painter.drawLine(QPointF(r, t), QPointF(r - bracket_len, t))
+            painter.drawLine(QPointF(r, t), QPointF(r, t + bracket_len))
+
+            # Bottom-left corner
+            painter.drawLine(QPointF(l, b), QPointF(l + bracket_len, b))
+            painter.drawLine(QPointF(l, b), QPointF(l, b - bracket_len))
+
+            # Bottom-right corner
+            painter.drawLine(QPointF(r, b), QPointF(r - bracket_len, b))
+            painter.drawLine(QPointF(r, b), QPointF(r, b - bracket_len))
+
+            # 4. Active crop status pill badge on top-left of the crop frame
+            tag = getattr(self, "_crop_indicator_tag", "")
+            dim = getattr(self, "_crop_indicator_dim", "")
+            badge_text = "✂ CROP ACTIVE"
+            if tag:
+                badge_text += f" • {tag}"
+            if dim:
+                badge_text += f" ({dim})"
+
+            font = QFont("Inter", 9, QFont.Bold)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(badge_text)
+            th = fm.height()
+
+            badge_x = l + 8
+            badge_y = t + 8
+            badge_w = tw + 16
+            badge_h = max(22.0, th + 8)
+
+            badge_rect = QRectF(badge_x, badge_y, badge_w, badge_h)
+
+            # Dark translucent pill background with subtle glow border
+            painter.setPen(QPen(QColor(94, 234, 212, 160), 1))
+            painter.setBrush(QColor(11, 16, 19, 220))
+            painter.drawRoundedRect(badge_rect, 5, 5)
+
+            # Badge text in accent teal
+            painter.setPen(QColor("#5eead4"))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+        painter.restore()
 
     def contextMenuEvent(self, event) -> None:  # noqa: ANN001
         self.contextMenuRequestedAt.emit(event.globalPos())
@@ -726,9 +893,13 @@ class MainWindow(QMainWindow):
         # Merge adjacent clips (M = merge right, Shift+M = merge left).
         QShortcut(QKeySequence(Qt.Key_M), self).activated.connect(self._merge_with_next_clip)
         QShortcut(QKeySequence("Shift+M"), self).activated.connect(self._merge_with_previous_clip)
-        # Esc cancels crop mode.
+        # Esc cancels crop mode; Enter/Return confirms crop mode.
         esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
         esc.activated.connect(self._on_escape_pressed)
+        ret = QShortcut(QKeySequence(Qt.Key_Return), self)
+        ret.activated.connect(self._on_enter_pressed)
+        ent = QShortcut(QKeySequence(Qt.Key_Enter), self)
+        ent.activated.connect(self._on_enter_pressed)
 
     # --- scrollbar glue ------------------------------------------------
 
@@ -912,6 +1083,7 @@ class MainWindow(QMainWindow):
         self.video_view.contextMenuRequestedAt.connect(self._show_preview_menu)
         self.crop_overlay = CropOverlay(self.video_container)
         self.crop_overlay.setVisible(False)
+        self.crop_overlay.confirmRequested.connect(self._on_crop_confirmed)
         self.video_container.installEventFilter(self)
         pv_lay.addWidget(self.video_container, stretch=1)
 
@@ -1050,10 +1222,19 @@ class MainWindow(QMainWindow):
             "Canvas fit mode: Fill (crop to fill), Fit (keep all with black bars), or Stretch"
         )
         self.crop_fit_combo.addItems(list(CROP_FIT_MODES.keys()))
-        self.crop_fit_combo.setCurrentText("Fill (Crop to fill)")
+        self.crop_fit_combo.setCurrentText("Fill (Crop to fill canvas)")
         self.crop_fit_combo.setVisible(False)
         self.crop_fit_combo.currentTextChanged.connect(self._on_crop_fit_mode_changed)
+        self.crop_confirm_btn = QPushButton("✓ Confirm")
+        self.crop_confirm_btn.setToolTip("Confirm crop and resume playback (Enter)")
+        self.crop_confirm_btn.setVisible(False)
+        self.crop_confirm_btn.setStyleSheet(
+            f"QPushButton {{ background: {theme.ACCENT}; color: {theme.ACCENT_INK}; font-weight: bold; border-radius: 4px; padding: 2px 8px; }}"
+            f"QPushButton:hover {{ background: {theme.ACCENT_2}; }}"
+        )
+        self.crop_confirm_btn.clicked.connect(self._on_crop_confirmed)
         self.crop_reset_btn = QPushButton("Reset crop")
+        self.crop_reset_btn.setToolTip("Reset crop to full frame")
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
 
@@ -1091,6 +1272,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.crop_btn)
         transport.addWidget(self.crop_aspect_combo)
         transport.addWidget(self.crop_fit_combo)
+        transport.addWidget(self.crop_confirm_btn)
         transport.addWidget(self.crop_reset_btn)
         transport.addSpacing(4)
         transport.addWidget(vol_divider)
@@ -2121,11 +2303,32 @@ class MainWindow(QMainWindow):
 
     def _sync_selected_clip_ui(self) -> None:
         self._sync_volume_ui()
+        self._update_crop_btn_style()
 
     def _on_clip_selected(self, clip_id: str) -> None:
         c = next((c for c in self._clips if c.id == clip_id), None)
         if c and self._preview_clip_id != c.id:
             self._set_preview_clip(c)
+        if self.crop_btn.isChecked() and c:
+            self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
+            if getattr(c, "crop_rect", None) is not None:
+                rx, ry, rw, rh = c.crop_rect
+                self.crop_aspect_combo.blockSignals(True)
+                self.crop_aspect_combo.setCurrentText(getattr(c, "crop_preset", "Free (Custom)"))
+                self.crop_aspect_combo.blockSignals(False)
+                self.crop_fit_combo.blockSignals(True)
+                mode_label = next((k for k, v in CROP_FIT_MODES.items() if v == getattr(c, "crop_fit_mode", "fill")), "Fill (Crop to fill canvas)")
+                self.crop_fit_combo.setCurrentText(mode_label)
+                self.crop_fit_combo.blockSignals(False)
+                self.crop_overlay.set_normalized_rect(QRectF(rx, ry, rw, rh))
+            else:
+                self.crop_aspect_combo.blockSignals(True)
+                self.crop_aspect_combo.setCurrentText("Free (Custom)")
+                self.crop_aspect_combo.blockSignals(False)
+                self.crop_fit_combo.blockSignals(True)
+                self.crop_fit_combo.setCurrentText("Fill (Crop to fill canvas)")
+                self.crop_fit_combo.blockSignals(False)
+                self.crop_overlay.reset()
         self._sync_selected_clip_ui()
         self._update_audio_volumes()
         self._update_controls_enabled()
@@ -3045,42 +3248,136 @@ class MainWindow(QMainWindow):
     def _sync_preview_canvas(self) -> None:
         c = self._current_preview_clip()
         if c is None or c.asset.width <= 0 or c.asset.height <= 0:
+            self.video_view.set_crop_indicator(active=False)
             return
         if self.crop_btn.isChecked():
             preset_key = self.crop_aspect_combo.currentText()
             aspect = CROP_ASPECT_PRESETS.get(preset_key)
             fit_label = self.crop_fit_combo.currentText()
             fit_mode = CROP_FIT_MODES.get(fit_label, "fill")
+            self.video_view.update_canvas(c.asset.width, c.asset.height, aspect, fit_mode, crop_rect=None)
+            self.crop_overlay.setVisible(fit_mode == "fill")
+            self.video_view.set_crop_indicator(active=False)
+            if self.crop_overlay.isVisible():
+                self.crop_overlay.raise_()
         else:
-            aspect = None
-            fit_mode = "fill"
+            self.crop_overlay.setVisible(False)
+            if getattr(c, "crop_rect", None) is not None:
+                aspect = CROP_ASPECT_PRESETS.get(getattr(c, "crop_preset", "Free (Custom)"))
+                fit_mode = getattr(c, "crop_fit_mode", "fill")
+                rx, ry, rw, rh = c.crop_rect
+                self.video_view.update_canvas(
+                    c.asset.width, c.asset.height, aspect, fit_mode, crop_rect=None
+                )
+                preset_name = getattr(c, "crop_preset", "")
+                tag = preset_name.split(" ")[0] if preset_name else ""
+                cw = int(round(rw * c.asset.width))
+                ch = int(round(rh * c.asset.height))
+                dim_str = f"{cw}×{ch}" if cw > 0 and ch > 0 else ""
+                self.video_view.set_crop_indicator(
+                    active=True, tag=tag, dimensions=dim_str, crop_norm_rect=c.crop_rect
+                )
+            else:
+                self.video_view.update_canvas(c.asset.width, c.asset.height, None, "fill", crop_rect=None)
+                self.video_view.set_crop_indicator(active=False)
+        self._update_crop_btn_style()
 
-        self.video_view.update_canvas(c.asset.width, c.asset.height, aspect, fit_mode)
-        self.crop_overlay.setVisible(self.crop_btn.isChecked() and fit_mode == "fill")
+    def _update_crop_btn_style(self) -> None:
+        c = self._selected_clip() or self._current_preview_clip()
+        has_active_crop = bool(c and getattr(c, "crop_rect", None) is not None)
+        if self.crop_btn.isChecked():
+            self.crop_btn.setText("Crop")
+            self.crop_btn.setToolTip("Adjust crop rectangle for the selected clip (Enter to confirm, Esc to cancel)")
+            self.crop_btn.setStyleSheet(
+                f"QPushButton {{ border-color: {theme.ACCENT}; color: {theme.ACCENT}; font-weight: bold; }}"
+            )
+        elif has_active_crop:
+            preset = getattr(c, "crop_preset", "")
+            tag = preset.split(" ")[0] if preset else ""
+            self.crop_btn.setText(f"Crop ({tag})" if tag and tag != "Free" else "Crop (Active)")
+            self.crop_btn.setToolTip("Crop is active on this clip. Click to edit, or use Reset crop to clear.")
+            self.crop_btn.setStyleSheet(
+                f"QPushButton {{ border-color: {theme.ACCENT}; color: {theme.ACCENT}; font-weight: bold; }}"
+            )
+        else:
+            self.crop_btn.setText("Crop")
+            self.crop_btn.setToolTip("Crop or change aspect ratio for the selected clip")
+            self.crop_btn.setStyleSheet("")
 
     def _on_crop_toggled(self, checked: bool) -> None:
-        c = self._selected_clip()
+        c = self._selected_clip() or self._current_preview_clip()
         if checked and not c:
             self.crop_btn.setChecked(False)
             return
         if checked and c:
             self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
-            if self.crop_overlay.normalized_rect() == QRectF(0, 0, 1, 1):
+            if getattr(c, "crop_rect", None) is not None:
+                rx, ry, rw, rh = c.crop_rect
+                self.crop_aspect_combo.blockSignals(True)
+                self.crop_aspect_combo.setCurrentText(getattr(c, "crop_preset", "Free (Custom)"))
+                self.crop_aspect_combo.blockSignals(False)
+                self.crop_fit_combo.blockSignals(True)
+                mode_label = next(
+                    (k for k, v in CROP_FIT_MODES.items() if v == getattr(c, "crop_fit_mode", "fill")),
+                    "Fill (Crop to fill canvas)",
+                )
+                self.crop_fit_combo.setCurrentText(mode_label)
+                self.crop_fit_combo.blockSignals(False)
+                self.crop_overlay.set_normalized_rect(QRectF(rx, ry, rw, rh))
+                ratio = CROP_ASPECT_PRESETS.get(getattr(c, "crop_preset", "Free (Custom)"))
+                self.crop_overlay.set_aspect_ratio_preset(ratio, getattr(c, "crop_preset", "Free (Custom)"))
+                self.crop_overlay.set_fit_mode(getattr(c, "crop_fit_mode", "fill"))
+            else:
                 preset_key = self.crop_aspect_combo.currentText()
                 ratio = CROP_ASPECT_PRESETS.get(preset_key)
                 if ratio is not None:
                     self.crop_overlay.set_aspect_ratio_preset(ratio, preset_key)
-                else:
+                elif self.crop_overlay.normalized_rect() == QRectF(0, 0, 1, 1):
                     self.crop_overlay.set_normalized_rect(QRectF(0.1, 0.1, 0.8, 0.8))
+
         self.crop_aspect_combo.setVisible(checked)
         self.crop_fit_combo.setVisible(checked)
+        self.crop_confirm_btn.setVisible(checked)
         self.crop_reset_btn.setVisible(checked)
         self._sync_preview_canvas()
         if checked and self.crop_overlay.isVisible():
             self.crop_overlay.raise_()
 
+    def _on_crop_confirmed(self) -> None:
+        c = self._selected_clip() or self._current_preview_clip()
+        if c is None:
+            self.crop_btn.setChecked(False)
+            return
+
+        r = self.crop_overlay.normalized_rect()
+        preset_key = self.crop_aspect_combo.currentText()
+        fit_label = self.crop_fit_combo.currentText()
+        fit_mode = CROP_FIT_MODES.get(fit_label, "fill")
+
+        self._snapshot()
+        if r == QRectF(0, 0, 1, 1) and preset_key == "Free (Custom)" and fit_mode == "fill":
+            c.crop_rect = None
+            c.crop_preset = "Free (Custom)"
+            c.crop_fit_mode = "fill"
+        else:
+            c.crop_rect = (r.x(), r.y(), r.width(), r.height())
+            c.crop_preset = preset_key
+            c.crop_fit_mode = fit_mode
+
+        self.crop_btn.blockSignals(True)
+        self.crop_btn.setChecked(False)
+        self.crop_btn.blockSignals(False)
+
+        self.crop_aspect_combo.setVisible(False)
+        self.crop_fit_combo.setVisible(False)
+        self.crop_confirm_btn.setVisible(False)
+        self.crop_reset_btn.setVisible(False)
+
+        self._sync_preview_canvas()
+        self.status.showMessage("Crop applied.", 2500)
+
     def _on_crop_aspect_changed(self, preset_name: str) -> None:
-        c = self._selected_clip()
+        c = self._selected_clip() or self._current_preview_clip()
         if c:
             self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
         ratio = CROP_ASPECT_PRESETS.get(preset_name)
@@ -3093,6 +3390,7 @@ class MainWindow(QMainWindow):
         self._sync_preview_canvas()
 
     def _on_crop_reset(self) -> None:
+        c = self._selected_clip() or self._current_preview_clip()
         self.crop_aspect_combo.blockSignals(True)
         self.crop_aspect_combo.setCurrentText("Free (Custom)")
         self.crop_aspect_combo.blockSignals(False)
@@ -3100,7 +3398,44 @@ class MainWindow(QMainWindow):
         self.crop_fit_combo.setCurrentText("Fill (Crop to fill canvas)")
         self.crop_fit_combo.blockSignals(False)
         self.crop_overlay.reset()
+        if c:
+            self._snapshot()
+            c.crop_rect = None
+            c.crop_preset = "Free (Custom)"
+            c.crop_fit_mode = "fill"
         self._sync_preview_canvas()
+        self.status.showMessage("Crop reset to full frame.", 2000)
+
+    def _on_escape_pressed(self) -> None:
+        if self.crop_btn.isChecked():
+            c = self._selected_clip() or self._current_preview_clip()
+            if c and getattr(c, "crop_rect", None) is not None:
+                rx, ry, rw, rh = c.crop_rect
+                self.crop_overlay.set_normalized_rect(QRectF(rx, ry, rw, rh))
+                self.crop_aspect_combo.blockSignals(True)
+                self.crop_aspect_combo.setCurrentText(getattr(c, "crop_preset", "Free (Custom)"))
+                self.crop_aspect_combo.blockSignals(False)
+                self.crop_fit_combo.blockSignals(True)
+                mode_label = next(
+                    (k for k, v in CROP_FIT_MODES.items() if v == getattr(c, "crop_fit_mode", "fill")),
+                    "Fill (Crop to fill canvas)",
+                )
+                self.crop_fit_combo.setCurrentText(mode_label)
+                self.crop_fit_combo.blockSignals(False)
+            else:
+                self.crop_overlay.reset()
+            self.crop_btn.blockSignals(True)
+            self.crop_btn.setChecked(False)
+            self.crop_btn.blockSignals(False)
+            self.crop_aspect_combo.setVisible(False)
+            self.crop_fit_combo.setVisible(False)
+            self.crop_confirm_btn.setVisible(False)
+            self.crop_reset_btn.setVisible(False)
+            self._sync_preview_canvas()
+
+    def _on_enter_pressed(self) -> None:
+        if self.crop_btn.isChecked():
+            self._on_crop_confirmed()
 
     # --- preview context menu ----------------------------------------
 
@@ -3137,14 +3472,25 @@ class MainWindow(QMainWindow):
             return
         self.status.showMessage(f"Saved frame → {Path(out_path).name}", 5000)
 
-    def _crop_pixels(self) -> tuple[int, int, int, int] | None:
-        c = self._selected_clip()
-        if not self.crop_btn.isChecked() or c is None:
+    def _crop_pixels(self, clip: Clip | None = None) -> tuple[int, int, int, int] | None:
+        c = clip or self._selected_clip() or self._current_preview_clip()
+        if c is None:
             return None
-        fit_mode = CROP_FIT_MODES.get(self.crop_fit_combo.currentText(), "fill")
-        if fit_mode != "fill":
+        fit_mode = "fill"
+        if self.crop_btn.isChecked():
+            fit_mode = CROP_FIT_MODES.get(self.crop_fit_combo.currentText(), "fill")
+            if fit_mode != "fill":
+                return None
+            r = self.crop_overlay.normalized_rect()
+        elif getattr(c, "crop_rect", None) is not None:
+            fit_mode = getattr(c, "crop_fit_mode", "fill")
+            if fit_mode != "fill":
+                return None
+            rx, ry, rw, rh = c.crop_rect
+            r = QRectF(rx, ry, rw, rh)
+        else:
             return None
-        r = self.crop_overlay.normalized_rect()
+
         if r == QRectF(0, 0, 1, 1):
             return None
         sw, sh = c.asset.width, c.asset.height
@@ -3476,11 +3822,15 @@ class MainWindow(QMainWindow):
         crop_pixels = self._crop_pixels()
         canvas_fit = "fill"
         canvas_aspect = None
+        c = self._selected_clip() or self._current_preview_clip()
         if self.crop_btn.isChecked():
             preset_key = self.crop_aspect_combo.currentText()
             canvas_aspect = CROP_ASPECT_PRESETS.get(preset_key)
             fit_label = self.crop_fit_combo.currentText()
             canvas_fit = CROP_FIT_MODES.get(fit_label, "fill")
+        elif c and getattr(c, "crop_rect", None) is not None:
+            canvas_aspect = CROP_ASPECT_PRESETS.get(getattr(c, "crop_preset", "Free (Custom)"))
+            canvas_fit = getattr(c, "crop_fit_mode", "fill")
 
         job = ExportJob(
             clips=[c.clone() for c in self._clips],

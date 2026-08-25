@@ -299,8 +299,23 @@ class ExportWorker(QObject):
                         "setpts=PTS-STARTPTS",
                     ]
 
-                    if job.crop and job.canvas_fit == "fill":
-                        x, y, w, h = job.crop
+                    clip_crop = None
+                    if getattr(c, "crop_rect", None) and getattr(c, "crop_fit_mode", "fill") == "fill":
+                        rx, ry, rw, rh = c.crop_rect
+                        cw = int(round(rw * c.asset.width))
+                        ch = int(round(rh * c.asset.height))
+                        cx = int(round(rx * c.asset.width))
+                        cy = int(round(ry * c.asset.height))
+                        cw -= cw % 2; ch -= ch % 2
+                        cx = max(0, min(c.asset.width - cw, cx - cx % 2))
+                        cy = max(0, min(c.asset.height - ch, cy - cy % 2))
+                        if cw >= 2 and ch >= 2:
+                            clip_crop = (cx, cy, cw, ch)
+                    elif job.crop and job.canvas_fit == "fill":
+                        clip_crop = job.crop
+
+                    if clip_crop:
+                        x, y, w, h = clip_crop
                         vchain.append(f"crop={w}:{h}:{x}:{y}")
                         vchain.append(
                             f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
